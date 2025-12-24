@@ -1,96 +1,95 @@
 """
-Finance Agent Evaluator - Green agent that runs Finance Agent Benchmark on purple agents.
+Finance Evaluator Agent - Main evaluation logic.
 
-This agent:
-1. Loads financial research tasks from dataset
-2. Sets up Gymnasium environments for each task
-3. Sends task prompts to the purple agent (the agent being tested)
-4. Parses the purple agent's tool-call responses
-5. Steps through the environment and evaluates results
+Based on green-agent-template pattern.
 """
-import argparse
-import asyncio
 import json
 import logging
 import time
 from typing import Any
 
 import gymnasium as gym
-import uvicorn
-from dotenv import load_dotenv
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse
-from starlette.routing import Route
+from pydantic import BaseModel, HttpUrl, ValidationError
+from a2a.server.tasks import TaskUpdater
+from a2a.types import Message, TaskState, Part, TextPart, DataPart
+from a2a.utils import get_message_text, new_agent_text_message
 
-load_dotenv()
-
-from a2a.server.apps import A2AStarletteApplication
-from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
-from a2a.types import (
-    AgentCapabilities,
-    AgentCard,
-    AgentSkill,
-    DataPart,
-    Part,
-    TaskState,
-    TextPart,
-)
-from a2a.utils import new_agent_text_message
-
-from agentbeats.green_executor import GreenAgent, GreenExecutor
-from agentbeats.models import EvalRequest
-from agentbeats.tool_provider import ToolProvider
-
+from messenger import Messenger
 from dataset import DatasetLoader, Task
 from environment import FinancialResearchEnv, register_finance_env
 from tools import get_tool_definitions
 
-
-# Health check handler
-async def health_check(request):
-    """Health check endpoint for Docker and load balancers."""
-    return JSONResponse({"status": "healthy", "service": "finance-evaluator", "version": "2.0.0"})
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("finance_evaluator")
-
-SUBMIT_ANSWER_ACTION = "submit_answer"
 
 # Register the Gymnasium environment
 register_finance_env()
 
 
-class FinanceEvaluator(GreenAgent):
+class EvalRequest(BaseModel):
+    """Request format sent by the AgentBeats platform to green agents."""
+    participants: dict[str, HttpUrl]  # role -> agent URL
+    config: dict[str, Any]
+
+
+class FinanceEvaluatorAgent:
     """Green agent that evaluates purple agents on financial research tasks."""
 
+    required_roles: list[str] = ["agent"]
+    required_config_keys: list[str] = []  # All config keys have defaults
+
     def __init__(self, data_path: str = "data/public.csv"):
-        self._required_roles = ["agent"]
-        self._required_config_keys = []  # No required config, all have defaults
-        self._tool_provider = ToolProvider()
-        self._dataset = DatasetLoader(data_path)
+        self.messenger = Messenger()
+        self.dataset = DatasetLoader(data_path)
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
-        missing_roles = set(self._required_roles) - set(request.participants.keys())
+        """Validate the evaluation request."""
+        missing_roles = set(self.required_roles) - set(request.participants.keys())
         if missing_roles:
             return False, f"Missing roles: {missing_roles}"
+
+        missing_config_keys = set(self.required_config_keys) - set(request.config.keys())
+        if missing_config_keys:
+            return False, f"Missing config keys: {missing_config_keys}"
+
         return True, "ok"
 
-    async def run_eval(self, req: EvalRequest, updater: TaskUpdater) -> None:
-        logger.info(f"Starting finance evaluation: {req}")
+    async def run(self, message: Message, updater: TaskUpdater) -> None:
+        """Run the evaluation.
+
+        Args:
+            message: The incoming evaluation request
+            updater: Report progress and results
+        """
+        input_text = get_message_text(message)
+
+        try:
+            request: EvalRequest = EvalRequest.model_validate_json(input_text)
+            ok, msg = self.validate_request(request)
+            if not ok:
+                await updater.reject(new_agent_text_message(msg))
+                return
+        except ValidationError as e:
+            await updater.reject(new_agent_text_message(f"Invalid request: {e}"))
+            return
+
+        await self._run_evaluation(request, updater)
+
+    async def _run_evaluation(self, request: EvalRequest, updater: TaskUpdater) -> None:
+        """Execute the evaluation logic."""
+        logger.info(f"Starting finance evaluation: {request}")
         start_time = time.time()
 
         # Get configuration with defaults
-        num_tasks = req.config.get("num_tasks", 10)
-        categories = req.config.get("categories", ["all"])
-        max_steps = req.config.get("max_steps", 50)
-        timeout = req.config.get("timeout", 600)
+        num_tasks = request.config.get("num_tasks", 10)
+        categories = request.config.get("categories", ["all"])
+        max_steps = request.config.get("max_steps", 50)
+        timeout = request.config.get("timeout", 600)
 
         # Get the purple agent URL
-        agent_url = str(req.participants["agent"])
+        agent_url = str(request.participants["agent"])
 
         # Load tasks
-        tasks = self._dataset.get_tasks(categories=categories, limit=num_tasks)
+        tasks = self.dataset.get_tasks(categories=categories, limit=num_tasks)
         logger.info(f"Running {len(tasks)} tasks")
 
         await updater.update_status(
@@ -142,7 +141,7 @@ class FinanceEvaluator(GreenAgent):
             naive_accuracy = sum(1 for r in all_rewards if r >= 0.8) / len(all_rewards) if all_rewards else 0
             avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0
 
-            # Class-balanced accuracy (average per category)
+            # Class-balanced accuracy
             per_category_accuracy = {}
             for cat, rewards in category_results.items():
                 per_category_accuracy[cat] = sum(1 for r in rewards if r >= 0.8) / len(rewards) if rewards else 0
@@ -185,7 +184,7 @@ Per-Category Results:
             )
 
         finally:
-            self._tool_provider.reset()
+            self.messenger.reset()
 
     async def _run_single_task(
         self,
@@ -194,7 +193,7 @@ Per-Category Results:
         max_steps: int,
         timeout: float,
     ) -> dict[str, Any]:
-        """Run a single financial research task and return the result."""
+        """Run a single financial research task."""
 
         env: FinancialResearchEnv = gym.make(
             "FinancialResearch-v0",
@@ -206,16 +205,14 @@ Per-Category Results:
         truncated = False
         observation, info = env.reset()
 
-        # Build the initial task description for the purple agent
+        # Build the initial task prompt
         task_prompt = self._build_task_prompt(task, info)
 
-        # Start a new conversation with the purple agent
         next_message = task_prompt
         is_first_message = True
         start_time = time.time()
 
         while not terminated and not truncated:
-            # Check timeout
             if time.time() - start_time > timeout:
                 truncated = True
                 break
@@ -223,7 +220,7 @@ Per-Category Results:
             logger.debug(f"Sending to purple agent: {next_message[:200]}...")
 
             # Send message to purple agent
-            response = await self._tool_provider.talk_to_agent(
+            response = await self.messenger.talk_to_agent(
                 message=next_message,
                 url=agent_url,
                 new_conversation=is_first_message,
@@ -232,12 +229,11 @@ Per-Category Results:
 
             logger.debug(f"Purple agent response: {response[:200]}...")
 
-            # Parse the purple agent's action
+            # Parse the action
             try:
                 action = self._parse_agent_response(response)
             except Exception as e:
                 logger.warning(f"Failed to parse agent response: {e}")
-                # Send error back and let agent retry
                 action = {"name": "_error", "arguments": {"message": str(e)}}
 
             # Step the environment
@@ -249,7 +245,7 @@ Per-Category Results:
 
             next_message = observation
 
-        # Get final evaluation from environment
+        # Get final evaluation
         final_result = info.get("evaluation", {})
 
         return {
@@ -309,12 +305,12 @@ Begin your research now.
 
         json_str = None
 
-        # Try to extract JSON from <json>...</json> tags
+        # Try <json>...</json> tags
         match = re.search(r'<json>\s*(.*?)\s*</json>', response, re.DOTALL)
         if match:
             json_str = match.group(1)
         else:
-            # Try to extract JSON from markdown code blocks
+            # Try markdown code blocks
             match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
             if match:
                 json_str = match.group(1)
@@ -326,77 +322,4 @@ Begin your research now.
         if json_str:
             return json.loads(json_str)
         else:
-            # Try to parse the entire response as JSON
             return json.loads(response)
-
-
-def finance_evaluator_agent_card(name: str, url: str) -> AgentCard:
-    """Create the agent card for the finance evaluator."""
-    skill = AgentSkill(
-        id="finance_research_evaluation",
-        name="Financial Research Benchmark",
-        description="Evaluates agents on 537 real-world financial research tasks across 9 categories",
-        tags=["benchmark", "finance", "evaluation", "gymnasium"],
-        examples=[
-            '{"participants": {"agent": "http://localhost:9019"}, "config": {"num_tasks": 10, "categories": ["all"]}}'
-        ],
-    )
-    return AgentCard(
-        name=name,
-        description="Finance Agent Benchmark 2.0 - Multi-dimensional evaluation for financial research agents",
-        url=url,
-        version="2.0.0",
-        default_input_modes=["text"],
-        default_output_modes=["text"],
-        capabilities=AgentCapabilities(streaming=True),
-        skills=[skill],
-    )
-
-
-async def main():
-    parser = argparse.ArgumentParser(description="Run the Finance Agent Evaluator.")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
-    parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
-    parser.add_argument("--card-url", type=str, help="External URL for the agent card")
-    parser.add_argument("--data-path", type=str, default="data/public.csv", help="Path to dataset")
-    args = parser.parse_args()
-
-    agent_url = args.card_url or f"http://{args.host}:{args.port}/"
-
-    agent = FinanceEvaluator(data_path=args.data_path)
-    executor = GreenExecutor(agent)
-    agent_card = finance_evaluator_agent_card("FinanceEvaluator", agent_url)
-
-    request_handler = DefaultRequestHandler(
-        agent_executor=executor,
-        task_store=InMemoryTaskStore(),
-    )
-
-    a2a_server = A2AStarletteApplication(
-        agent_card=agent_card,
-        http_handler=request_handler,
-    )
-
-    # Build the A2A app and add health check route
-    a2a_app = a2a_server.build()
-
-    # Create wrapper app with health check
-    routes = [
-        Route("/health", health_check, methods=["GET"]),
-    ]
-
-    # Mount A2A app
-    app = Starlette(routes=routes)
-    app.mount("/", a2a_app)
-
-    uvicorn_config = uvicorn.Config(app, host=args.host, port=args.port)
-    uvicorn_server = uvicorn.Server(uvicorn_config)
-
-    logger.info(f"Starting Finance Evaluator on {args.host}:{args.port}")
-    logger.info(f"Health check: http://{args.host}:{args.port}/health")
-
-    await uvicorn_server.serve()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

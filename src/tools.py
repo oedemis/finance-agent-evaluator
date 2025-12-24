@@ -7,6 +7,8 @@ Tools available to purple agents:
 3. parse_html_page - Parse and store HTML content
 4. retrieve_information - Extract info from stored documents using LLM
 5. submit_answer - Submit final answer (terminates episode)
+
+Uses LiteLLM for LLM calls to support multiple providers.
 """
 import json
 import os
@@ -15,6 +17,7 @@ from typing import Any, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
+import litellm
 
 
 # Tool costs (approximate)
@@ -145,12 +148,7 @@ class BaseTool(ABC):
 
     @abstractmethod
     async def execute(self, arguments: dict, **kwargs) -> tuple[str, float]:
-        """
-        Execute the tool.
-
-        Returns:
-            tuple of (result_string, cost)
-        """
+        """Execute the tool. Returns (result_string, cost)."""
         pass
 
 
@@ -301,13 +299,13 @@ class ParseHtmlTool(BaseTool):
 
 
 class RetrieveInformationTool(BaseTool):
-    """Retrieve information from stored documents using LLM."""
+    """Retrieve information from stored documents using LLM via LiteLLM."""
 
     name = "retrieve_information"
     cost = TOOL_COSTS["retrieve_information"]
 
-    def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY")
+    def __init__(self, model: str = "gpt-4o-mini"):
+        self.model = model
 
     async def execute(
         self,
@@ -356,32 +354,14 @@ class RetrieveInformationTool(BaseTool):
         except KeyError as e:
             return json.dumps({"error": f"Key error: {e}"}), 0.0
 
-        # Call LLM
-        if not self.api_key:
-            # Fallback: just return first 500 chars of content
-            return json.dumps({
-                "warning": "OPENAI_API_KEY not set, returning raw content",
-                "content": final_prompt[:500]
-            }), 0.0
-
+        # Call LLM via LiteLLM
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "gpt-4o-mini",
-                        "messages": [{"role": "user", "content": final_prompt}],
-                        "max_tokens": 1000,
-                    },
-                ) as response:
-                    response.raise_for_status()
-                    result = await response.json()
-
-            answer = result["choices"][0]["message"]["content"]
+            response = await litellm.acompletion(
+                model=self.model,
+                messages=[{"role": "user", "content": final_prompt}],
+                max_tokens=1000,
+            )
+            answer = response.choices[0].message.content
             return json.dumps({"result": answer}), self.cost
 
         except Exception as e:
@@ -391,12 +371,12 @@ class RetrieveInformationTool(BaseTool):
 class ToolExecutor:
     """Executes tools by name."""
 
-    def __init__(self):
+    def __init__(self, retrieval_model: str = "gpt-4o-mini"):
         self._tools: dict[str, BaseTool] = {
             "edgar_search": EdgarSearchTool(),
             "google_web_search": GoogleSearchTool(),
             "parse_html_page": ParseHtmlTool(),
-            "retrieve_information": RetrieveInformationTool(),
+            "retrieve_information": RetrieveInformationTool(model=retrieval_model),
         }
 
     def execute(
@@ -405,12 +385,7 @@ class ToolExecutor:
         arguments: dict,
         data_storage: Optional[dict] = None,
     ) -> tuple[str, float]:
-        """
-        Execute a tool synchronously.
-
-        For now, we run async tools with asyncio.run().
-        In production, this should be fully async.
-        """
+        """Execute a tool synchronously."""
         import asyncio
 
         if tool_name not in self._tools:
