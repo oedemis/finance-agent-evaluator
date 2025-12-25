@@ -3,17 +3,43 @@ Gymnasium Environment for Financial Research.
 
 This environment simulates a financial research task where an agent
 must gather information and provide an answer.
+Includes OpenTelemetry tracing for Phoenix observability.
 """
+import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import gymnasium as gym
 from gymnasium import spaces
 
 from dataset import Task
-from tools import ToolExecutor, get_tool_definitions
+from tools import ToolExecutor, get_tool_definitions, TOOL_COSTS
+
+logger = logging.getLogger("finance_evaluator.environment")
+
+# Optional OpenTelemetry tracing with OpenInference semantic conventions
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind, Status, StatusCode
+    from openinference.semconv.trace import SpanAttributes, ToolCallAttributes
+    _tracer = trace.get_tracer("finance_evaluator.environment")
+    _HAS_OTEL = True
+
+    # OpenInference semantic conventions for Phoenix display
+    # See: https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md
+    INPUT_VALUE = SpanAttributes.INPUT_VALUE
+    OUTPUT_VALUE = SpanAttributes.OUTPUT_VALUE
+    OPENINFERENCE_SPAN_KIND = SpanAttributes.OPENINFERENCE_SPAN_KIND
+except ImportError:
+    _HAS_OTEL = False
+    _tracer = None
+    INPUT_VALUE = OUTPUT_VALUE = OPENINFERENCE_SPAN_KIND = None
+    SpanAttributes = None
+    ToolCallAttributes = None
 
 
 @dataclass
@@ -50,20 +76,28 @@ class FinancialResearchEnv(gym.Env):
         task: Task,
         max_steps: int = 50,
         render_mode: Optional[str] = None,
+        use_llm_judges: bool = True,
+        judge_model: str = "gpt-4o-mini",
     ):
         super().__init__()
 
         self.task = task
         self.max_steps = max_steps
         self.render_mode = render_mode
+        self.use_llm_judges = use_llm_judges
+        self.judge_model = judge_model
 
         # Initialize tool executor
         self.tool_executor = ToolExecutor()
+
+        # LLM Judges (lazy loaded)
+        self._evaluation_orchestrator = None
 
         # State
         self.state = EnvironmentState()
         self.agent_answer: Optional[str] = None
         self.trajectory: list[dict] = []
+        self.tool_calls: list[dict] = []  # Track tool calls for process evaluation
 
         # Define action and observation spaces
         # Action space: JSON string representing tool call
@@ -84,6 +118,7 @@ class FinancialResearchEnv(gym.Env):
         self.state.start_time = time.time()
         self.agent_answer = None
         self.trajectory = []
+        self.tool_calls = []
 
         # Build initial observation
         observation = self._build_observation(
@@ -163,14 +198,75 @@ class FinancialResearchEnv(gym.Env):
             observation = self._handle_error(arguments.get("message", "Unknown error"))
             return observation, 0.0, False, False, {"step": self.state.current_step}
 
-        # Execute the tool
-        try:
-            result, cost = self.tool_executor.execute(
+        # Execute the tool with optional OpenTelemetry tracing
+        def _execute_tool():
+            return self.tool_executor.execute(
                 tool_name=tool_name,
                 arguments=arguments,
                 data_storage=self.state.data_storage,
             )
-            self.state.cost_spent += cost
+
+        try:
+            if _HAS_OTEL and _tracer and SpanAttributes:
+                # Use OpenInference TOOL span kind for proper Phoenix display
+                # See: https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md#tool-calls
+                with _tracer.start_as_current_span(
+                    f"Tool: {tool_name}",
+                    kind=SpanKind.INTERNAL,
+                    attributes={
+                        OPENINFERENCE_SPAN_KIND: "TOOL",  # Mark as TOOL for Phoenix
+                        SpanAttributes.TOOL_NAME: tool_name,
+                        SpanAttributes.TOOL_DESCRIPTION: f"Finance research tool: {tool_name}",
+                        SpanAttributes.TOOL_PARAMETERS: json.dumps(arguments),
+                        # Input/Output for Phoenix UI
+                        INPUT_VALUE: json.dumps(arguments),
+                        # Custom attributes
+                        "tool.step": self.state.current_step,
+                        "tool.cost": TOOL_COSTS.get(tool_name, 0.0),
+                    }
+                ) as span:
+                    result_dict, cost = _execute_tool()
+
+                    # Set output and status
+                    result_str = str(result_dict.get("result", ""))
+                    success = result_dict.get("success", False)
+
+                    span.set_attribute(OUTPUT_VALUE, result_str[:2000] if result_str else "")
+                    span.set_attribute("tool.success", success)
+                    span.set_attribute("tool.actual_cost", cost)
+
+                    if success:
+                        span.set_status(Status(StatusCode.OK))
+                    else:
+                        span.set_status(Status(StatusCode.ERROR, result_str[:100]))
+            else:
+                result_dict, cost = _execute_tool()
+
+            # Extract result string from {"success": bool, "result": ...} format
+            success = result_dict.get("success", False)
+            result_content = result_dict.get("result", "")
+
+            # Handle retrieve_information usage metadata and ACTUAL cost
+            actual_cost = cost  # Default to fixed cost
+            if tool_name == "retrieve_information" and "usage" in result_dict:
+                usage = result_dict["usage"]
+                logger.info(f"retrieve_information usage: {usage}")
+                # Use actual cost if available
+                if "cost_usd" in usage:
+                    actual_cost = usage["cost_usd"]
+                    logger.info(f"Using actual cost ${actual_cost:.6f} instead of fixed ${cost:.6f}")
+
+            self.state.cost_spent += actual_cost
+
+            # Track tool calls for process evaluation
+            self.tool_calls.append({
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "result": str(result_content)[:2000],  # Truncate for judges
+                "success": success,
+                "cost": actual_cost,  # Use actual cost, not fixed
+                "step": self.state.current_step,
+            })
 
             # Track documents accessed
             if tool_name == "parse_html_page" and "url" in arguments:
@@ -178,15 +274,21 @@ class FinancialResearchEnv(gym.Env):
 
             observation = self._build_observation(
                 obs_type="tool_result",
-                content=result,
+                content=str(result_content),
                 metadata={
                     "tool": tool_name,
-                    "cost": cost,
+                    "cost": actual_cost,  # Use actual cost
+                    "success": success,
                     "step": self.state.current_step,
                 }
             )
 
         except Exception as e:
+            if _HAS_OTEL and _tracer:
+                span = trace.get_current_span()
+                if span:
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                    span.record_exception(e)
             observation = self._handle_error(f"Tool execution failed: {str(e)}")
 
         # Calculate intermediate reward (small penalties/bonuses)
@@ -240,7 +342,7 @@ class FinancialResearchEnv(gym.Env):
 
         # Add instruction based on type
         if obs_type == "tool_result":
-            obs["next_step"] = "Continue research or submit your final answer using submit_answer tool."
+            obs["next_step"] = "Continue research or submit your final answer using FINAL ANSWER: format."
         elif obs_type == "error":
             obs["next_step"] = "Please fix the issue and try again."
 
@@ -276,8 +378,7 @@ class FinancialResearchEnv(gym.Env):
         """
         Evaluate the agent's answer against the ground truth.
 
-        This is a simplified evaluation - the full evaluation with
-        LLM judges will be added in Phase 3.
+        Uses LLM judges if enabled, otherwise falls back to heuristic evaluation.
         """
         if not self.agent_answer:
             return {
@@ -288,18 +389,88 @@ class FinancialResearchEnv(gym.Env):
                 "passed": False,
             }
 
-        # Simplified evaluation: check for keyword overlap
-        # (This will be replaced with LLM judges in Phase 3)
+        if self.use_llm_judges:
+            return self._evaluate_with_llm_judges()
+        else:
+            return self._evaluate_heuristic()
+
+    def _evaluate_with_llm_judges(self) -> dict:
+        """Evaluate using LLM judges (async wrapper)."""
+        try:
+            # Lazy load the orchestrator to avoid import issues
+            if self._evaluation_orchestrator is None:
+                from judges import EvaluationOrchestrator
+                self._evaluation_orchestrator = EvaluationOrchestrator(model=self.judge_model)
+
+            # Build trajectory string for judges
+            trajectory = self._build_trajectory_string()
+
+            # Convert rubrics to list of dicts
+            rubrics = []
+            if self.task.rubrics:
+                rubrics = [{"criteria": r.criteria, "operator": r.operator} for r in self.task.rubrics]
+
+            # Run async evaluation in sync context
+            async def run_evaluation():
+                return await self._evaluation_orchestrator.evaluate(
+                    question=self.task.question,
+                    expert_answer=self.task.expert_answer,
+                    agent_answer=self.agent_answer,
+                    trajectory=trajectory,
+                    tool_calls=self.tool_calls,
+                    rubrics=rubrics,
+                )
+
+            # Execute async code in sync context
+            try:
+                loop = asyncio.get_running_loop()
+                # Already in async context, use ThreadPoolExecutor
+                with ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, run_evaluation())
+                    result = future.result(timeout=120)  # 2 minute timeout
+            except RuntimeError:
+                # No running loop, safe to use asyncio.run
+                result = asyncio.run(run_evaluation())
+
+            # Add passed flag
+            result["passed"] = result.get("reward", 0.0) >= 0.8
+
+            logger.info(f"LLM Judge evaluation: reward={result['reward']:.3f}, "
+                       f"factual={result['factual_accuracy']:.3f}, "
+                       f"process={result['process_quality']:.3f}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"LLM judge evaluation failed: {e}, falling back to heuristic")
+            return self._evaluate_heuristic()
+
+    def _build_trajectory_string(self) -> str:
+        """Build a readable trajectory string for judges."""
+        lines = []
+        for tc in self.tool_calls:
+            lines.append(f"Step {tc['step']}: {tc['tool_name']}")
+            if tc.get('arguments'):
+                args_str = json.dumps(tc['arguments'], indent=2)
+                lines.append(f"  Arguments: {args_str}")
+            if tc.get('result'):
+                result_preview = tc['result'][:500]
+                lines.append(f"  Result: {result_preview}...")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _evaluate_heuristic(self) -> dict:
+        """Fallback heuristic evaluation (no LLM calls)."""
         answer_lower = self.agent_answer.lower()
         expert_lower = self.task.expert_answer.lower()
 
-        # Count matching words (very basic)
+        # Count matching words (basic overlap)
         answer_words = set(answer_lower.split())
         expert_words = set(expert_lower.split())
         overlap = len(answer_words & expert_words)
         max_words = max(len(expert_words), 1)
 
-        # Very rough factual accuracy estimate
+        # Rough factual accuracy estimate
         factual_accuracy = min(1.0, overlap / max_words * 2)
 
         # Process quality based on tool usage
@@ -317,10 +488,10 @@ class FinancialResearchEnv(gym.Env):
         return {
             "reward": reward,
             "factual_accuracy": factual_accuracy,
-            "has_contradiction": False,  # Will be evaluated by LLM in Phase 3
+            "has_contradiction": False,
             "process_quality": process_quality,
             "passed": reward >= 0.8,
-            "rubric_results": [],  # Will be filled by LLM judges
+            "rubric_results": [],
         }
 
     def render(self) -> None:

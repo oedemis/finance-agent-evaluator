@@ -61,7 +61,33 @@ SEC_EDGAR_API_KEY=your_sec_key        # For EDGAR search
 ### Run Locally
 
 ```bash
-uv run python src/evaluator.py --host 0.0.0.0 --port 9009
+uv run python src/server.py --host 127.0.0.1 --port 9009
+```
+
+**CLI Options:**
+```
+--host HOST           Host to bind (default: 127.0.0.1)
+--port PORT           Port to bind (default: 9009)
+--card-url URL        External URL for agent card
+--data-path PATH      Path to dataset (default: data/public.csv)
+--trace-dir DIR       Directory to save execution traces (default: traces)
+--phoenix             Enable Phoenix observability
+--phoenix-endpoint    Phoenix endpoint URL (default: http://localhost:6006)
+--no-llm-judges       Disable LLM judges (use heuristic evaluation)
+--judge-model MODEL   Model to use for LLM judges (default: gpt-4o-mini)
+```
+
+### With Phoenix Observability
+
+```bash
+# Install Phoenix dependencies
+pip install ".[phoenix]"
+
+# Start Phoenix server (separate terminal)
+phoenix serve
+
+# Run with Phoenix tracing
+uv run python src/server.py --phoenix --trace-dir ../FAB/traces
 ```
 
 ### Run with Docker
@@ -71,7 +97,12 @@ docker build -t finance-evaluator:v2.0 .
 docker run -p 9009:9009 --env-file .env finance-evaluator:v2.0
 ```
 
-### Test with AgentBeats
+### Run with FAB Scenario Runner
+
+```bash
+cd ../FAB
+uv run fab-run scenario.toml
+```
 
 See `../FAB/scenario.toml` for configuration.
 
@@ -92,14 +123,22 @@ See `../FAB/scenario.toml` for configuration.
 
 ### 3. Evaluation System
 
-**Judges (LLM-based):**
-- Factual Accuracy Judge: Rubric-based evaluation
-- Contradiction Judge: Detects factual contradictions
+**LLM Judges** (`judges.py`):
+- **FactualAccuracyJudge**: Rubric-based evaluation against expert answer
+- **ContradictionJudge**: Detects factual contradictions between agent/expert
+- **ProcessQualityJudge**: Evaluates research methodology and tool usage
+- **EvaluationOrchestrator**: Runs all judges concurrently, aggregates results
 
-**Metrics (Computed):**
-- Process Quality: Trajectory analysis (rule-based)
+**Prompts** (`prompts/`):
+- `factual_accuracy_judge.txt`: Factual accuracy evaluation prompt
+- `contradiction_judge.txt`: Contradiction detection prompt
+- `process_quality_judge.txt`: Process quality evaluation prompt
+- `task_prompt.txt`: Initial task prompt for purple agent
+
+**Computed Metrics:**
 - Cost Tracking: $ per task
 - Time Tracking: Seconds per task
+- Trajectory Stats: Tool usage, redundancy, coverage
 
 ### 4. Tools
 - `search_edgar`: SEC EDGAR database search
@@ -140,23 +179,26 @@ Question,Answer,Question Type,Expert time (mins),Rubric
 ```
 finance-agent-evaluator/
 ├── src/
-│   ├── evaluator.py          # Main green agent
+│   ├── server.py             # Main entry point (A2A server)
+│   ├── executor.py           # AgentExecutor (manages agent instances)
+│   ├── agent.py              # FinanceEvaluatorAgent (evaluation logic)
+│   ├── messenger.py          # A2A client for purple agent communication
 │   ├── environment.py        # Gymnasium environment
-│   ├── judges.py             # LLM judges
-│   ├── metrics.py            # Metrics computation
-│   ├── orchestrator.py       # Orchestration logic
-│   ├── models.py             # Data models
-│   └── tools/
-│       ├── edgar.py          # EDGAR search
-│       ├── google.py         # Google search
-│       ├── html_parser.py    # HTML parsing
-│       └── retriever.py      # Information retrieval
+│   ├── dataset.py            # Dataset loading utilities
+│   ├── tools.py              # Tool implementations (EDGAR, Google, etc.)
+│   ├── judges.py             # LLM-based evaluation judges
+│   ├── tracer.py             # Execution trace logging
+│   ├── observability.py      # Phoenix integration
+│   └── prompts/              # Prompt templates (separated from code)
+│       ├── __init__.py       # load_prompt(), format_prompt()
+│       ├── factual_accuracy_judge.txt
+│       ├── contradiction_judge.txt
+│       ├── process_quality_judge.txt
+│       └── task_prompt.txt
 ├── data/
-│   └── public.csv            # Public dataset
+│   └── public.csv            # Public dataset (50 tasks)
 ├── tests/
-│   ├── test_environment.py
-│   ├── test_judges.py
-│   └── test_tools.py
+│   └── ...
 ├── Dockerfile
 ├── pyproject.toml
 └── README.md

@@ -1,0 +1,80 @@
+You are an expert financial analyst evaluating the factual accuracy of a research agent's answer.
+
+TASK: Check if KEY FACTS from the rubric items are present in the agent's answer (RECALL metric).
+
+QUESTION:
+{question}
+
+AGENT'S ANSWER:
+{agent_answer}
+
+KEY FACTS TO VERIFY (Rubric Items - each represents a critical fact):
+{rubrics}
+
+EXPERT ANSWER (Reference - for context only):
+{expert_answer}
+
+INSTRUCTIONS FOR EVALUATION:
+
+This is a RECALL evaluation - check if the KEY FACTS from the rubric items are PRESENT in the agent's answer.
+
+For each rubric item:
+- Score 1: The key fact IS present in the agent's answer (wording may differ, that's OK)
+- Score 0: The key fact IS NOT present or is incorrect
+
+IMPORTANT:
+- Focus on PRESENCE of facts, not exact wording or phrasing
+- Different sentence structure is acceptable
+- Additional context or explanation is acceptable
+- Only mark as 0 if the fact is genuinely missing or wrong
+
+Overall score calculation:
+- Count rubric items with score 1
+- Divide by total rubric items
+- Example: 3 out of 4 facts present = 0.75 score
+
+ACCURACY CHECKS:
+1. Numerical Accuracy: Are numbers, percentages, and financial figures correct?
+2. Entity Accuracy: Are company names, dates, and other entities correct?
+3. No Contradictions: Facts should not contradict the rubric items (wrong facts should be marked 0)
+
+SCORING:
+- 1.0: All key facts present and correct
+- 0.75: Most key facts present (e.g., 3 out of 4)
+- 0.5: Half of key facts present
+- 0.25: Few key facts present
+- 0.0: No key facts present or all incorrect
+
+Respond with a JSON object:
+
+CRITICAL: In the "rubric_scores" object, use the FULL numbered rubric text as keys (e.g., "1. Fact text", "2. Fact text"), NOT just numbers like "1", "2"!
+
+Example with numbered rubrics:
+```json
+{{
+  "score": 0.67,
+  "rubric_scores": {{
+    "1. Nippon Steel made an unsolicited offer": 1,
+    "2. U.S. Steel rejected the offer": 1,
+    "3. The merger was blocked": 0
+  }},
+  "reasoning": "Agent found facts 1 and 2 but missed fact 3",
+  ...
+}}
+```
+
+Your response format:
+```json
+{{
+  "score": <float between 0.0 and 1.0>,
+  "rubric_scores": {{
+    "1. <first rubric text>": <0 or 1>,
+    "2. <second rubric text>": <0 or 1>,
+    ...
+  }},
+  "reasoning": "<brief explanation of your scoring>",
+  "key_facts_found": ["<list of correct key facts>"],
+  "key_facts_missing": ["<list of missing key facts>"],
+  "errors": ["<list of factual errors if any>"]
+}}
+```

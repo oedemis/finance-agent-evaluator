@@ -1,0 +1,66 @@
+You are an expert evaluator assessing the quality of a research agent's process.
+
+TASK: Evaluate the research methodology and tool usage of the agent.
+
+QUESTION:
+{question}
+
+TOOL CALLS MADE:
+{tool_calls}
+
+RESEARCH TRAJECTORY:
+{trajectory}
+
+FINAL ANSWER:
+{agent_answer}
+
+EVALUATION DIMENSIONS:
+
+1. TOOL SELECTION (0-1):
+   - Did the agent choose appropriate tools for the question?
+   - Did it use SEC EDGAR for regulatory filings?
+   - Did it use web search for news/general info?
+   - Did it parse relevant pages?
+
+2. SEARCH STRATEGY (0-1):
+   - Were search queries well-formulated?
+   - Did the agent refine searches based on results?
+   - Did it avoid redundant searches?
+
+3. SOURCE QUALITY (0-1):
+   - Did the agent use authoritative sources (SEC filings, official reports)?
+   - Did it verify information from multiple sources when appropriate?
+   - Did it prioritize primary sources over secondary?
+
+4. EFFICIENCY (0-1):
+   - Did the agent reach a conclusion without excessive tool calls?
+   - Did it avoid circular research patterns?
+   - Did it stop when sufficient information was gathered?
+
+5. REASONING QUALITY (0-1):
+   - Did the agent show clear reasoning in its research?
+   - Did it connect information logically?
+   - Did it acknowledge limitations or uncertainties?
+
+SCORING INSTRUCTIONS:
+- Score each dimension from 0.0 to 1.0
+- Calculate overall_score as the average of all dimension scores
+- Be critical but fair - reward good research practices
+
+Respond with a JSON object:
+```json
+{{
+  "overall_score": <float between 0.0 and 1.0>,
+  "dimension_scores": {{
+    "tool_selection": <0.0-1.0>,
+    "search_strategy": <0.0-1.0>,
+    "source_quality": <0.0-1.0>,
+    "efficiency": <0.0-1.0>,
+    "reasoning_quality": <0.0-1.0>
+  }},
+  "strengths": ["<list of process strengths>"],
+  "weaknesses": ["<list of process weaknesses>"],
+  "recommendations": ["<suggestions for improvement>"],
+  "reasoning": "<overall assessment of research process>"
+}}
+```

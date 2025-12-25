@@ -6,7 +6,9 @@ Based on green-agent-template pattern.
 import json
 import logging
 import time
-from typing import Any
+from datetime import datetime
+from typing import Any, Optional
+from uuid import uuid4
 
 import gymnasium as gym
 from pydantic import BaseModel, HttpUrl, ValidationError
@@ -15,9 +17,11 @@ from a2a.types import Message, TaskState, Part, TextPart, DataPart
 from a2a.utils import get_message_text, new_agent_text_message
 
 from messenger import Messenger
-from dataset import DatasetLoader, Task
+from dataset import DatasetLoader, Task, RubricItem
 from environment import FinancialResearchEnv, register_finance_env
 from tools import get_tool_definitions
+from tracer import TraceLogger
+from prompts import format_prompt
 
 logger = logging.getLogger("finance_evaluator")
 
@@ -37,9 +41,18 @@ class FinanceEvaluatorAgent:
     required_roles: list[str] = ["agent"]
     required_config_keys: list[str] = []  # All config keys have defaults
 
-    def __init__(self, data_path: str = "data/public.csv"):
+    def __init__(
+        self,
+        data_path: str = "data/public.csv",
+        trace_dir: Optional[str] = None,
+        use_llm_judges: bool = True,
+        judge_model: str = "gpt-4o-mini",
+    ):
         self.messenger = Messenger()
         self.dataset = DatasetLoader(data_path)
+        self.tracer = TraceLogger(output_dir=trace_dir)
+        self.use_llm_judges = use_llm_judges
+        self.judge_model = judge_model
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
         """Validate the evaluation request."""
@@ -84,13 +97,31 @@ class FinanceEvaluatorAgent:
         categories = request.config.get("categories", ["all"])
         max_steps = request.config.get("max_steps", 50)
         timeout = request.config.get("timeout", 600)
+        custom_query = request.config.get("custom_query")
 
         # Get the purple agent URL
         agent_url = str(request.participants["agent"])
 
-        # Load tasks
-        tasks = self.dataset.get_tasks(categories=categories, limit=num_tasks)
+        # Load tasks - either from dataset or custom query
+        if custom_query:
+            # Create a custom task for the user's question
+            logger.info(f"Running custom query: {custom_query[:100]}...")
+            tasks = [Task(
+                id="custom_query",
+                question=custom_query,
+                expert_answer="[Custom query - no expert answer available]",
+                category="Custom Query",
+                expert_time_mins=0.0,
+                rubrics=[],  # No rubrics for custom queries
+            )]
+        else:
+            tasks = self.dataset.get_tasks(categories=categories, limit=num_tasks)
+
         logger.info(f"Running {len(tasks)} tasks")
+
+        # Start tracing
+        run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+        self.tracer.start_run(run_id, dict(request.config), agent_url)
 
         await updater.update_status(
             TaskState.working,
@@ -102,10 +133,18 @@ class FinanceEvaluatorAgent:
 
         try:
             for i, task in enumerate(tasks):
-                logger.info(f"Running task {i+1}/{len(tasks)}: {task.id}...")
+                logger.info(f"🚀 Running task {i+1}/{len(tasks)}: {task.id}...")
                 await updater.update_status(
                     TaskState.working,
-                    new_agent_text_message(f"Running task {i+1}/{len(tasks)}: {task.category}")
+                    new_agent_text_message(f"🚀 Running task {i+1}/{len(tasks)}: {task.category}")
+                )
+
+                # Start task tracing
+                self.tracer.start_task(
+                    task_id=task.id,
+                    question=task.question,
+                    category=task.category,
+                    expert_answer=task.expert_answer,
                 )
 
                 try:
@@ -122,17 +161,35 @@ class FinanceEvaluatorAgent:
                         category_results[task.category] = []
                     category_results[task.category].append(task_result["reward"])
 
-                    logger.info(f"Task {task.id} completed with reward: {task_result['reward']:.2f}")
+                    # Emoji status based on pass/fail
+                    task_status = "✅" if task_result.get("passed", False) else "❌"
+                    benchmark_passed = task_result.get("benchmark_mode", {}).get("passed", False)
+                    rl_passed = task_result.get("rl_mode", {}).get("passed", False)
+                    benchmark_emoji = "✅" if benchmark_passed else "❌"
+                    rl_emoji = "✅" if rl_passed else "❌"
+
+                    logger.info(f"{task_status} Task {task.id} completed | "
+                               f"Benchmark: {benchmark_emoji} {task_result.get('benchmark_mode', {}).get('reward', 0):.2f} | "
+                               f"RL: {rl_emoji} {task_result['reward']:.2f} | "
+                               f"💰 ${task_result.get('costs', {}).get('total_usd', 0):.4f}")
+
+                    # Complete task trace
+                    self.tracer.complete_task(task_result)
+
                 except Exception as e:
-                    logger.error(f"Task {task.id} failed: {e}")
-                    results["tasks"][task.id] = {
+                    logger.error(f"❌ Task {task.id} failed: {e}")
+                    error_result = {
                         "reward": 0.0,
                         "error": str(e),
                         "passed": False,
                     }
+                    results["tasks"][task.id] = error_result
                     if task.category not in category_results:
                         category_results[task.category] = []
                     category_results[task.category].append(0.0)
+
+                    # Complete task trace with error
+                    self.tracer.complete_task(error_result)
 
             # Calculate aggregate metrics
             time_used = time.time() - start_time
@@ -164,16 +221,23 @@ class FinanceEvaluatorAgent:
                 for cat, acc in per_category_accuracy.items()
             )
 
-            summary = f"""Finance Agent Benchmark Results
+            summary = f"""🏆 Finance Agent Benchmark Results
 ================================
-Tasks: {len(tasks)}
-Naive Accuracy: {naive_accuracy*100:.1f}%
-Class-Balanced Accuracy: {class_balanced_accuracy*100:.1f}%
-Average Reward: {avg_reward:.3f}
-Time: {time_used:.1f}s
+📊 Tasks: {len(tasks)}
+✅ Naive Accuracy: {naive_accuracy*100:.1f}%
+🎯 Class-Balanced Accuracy: {class_balanced_accuracy*100:.1f}%
+📈 Average Reward: {avg_reward:.3f}
+⏱️  Time: {time_used:.1f}s
 
-Per-Category Results:
+📁 Per-Category Results:
 {category_str}"""
+
+            # Complete run trace
+            run_trace = self.tracer.complete_run(result_data)
+            if run_trace and self.tracer.output_dir:
+                trace_file = self.tracer.output_dir / f"{run_trace.run_id}.json"
+                summary += f"\n\nTrace saved to: {trace_file}"
+                result_data["trace_file"] = str(trace_file)
 
             await updater.add_artifact(
                 parts=[
@@ -199,6 +263,8 @@ Per-Category Results:
             "FinancialResearch-v0",
             task=task,
             max_steps=max_steps,
+            use_llm_judges=self.use_llm_judges,
+            judge_model=self.judge_model,
         )
 
         terminated = False
@@ -219,6 +285,9 @@ Per-Category Results:
 
             logger.debug(f"Sending to purple agent: {next_message[:200]}...")
 
+            # Log outgoing message
+            self.tracer.log_message("user", next_message)
+
             # Send message to purple agent
             response = await self.messenger.talk_to_agent(
                 message=next_message,
@@ -236,8 +305,25 @@ Per-Category Results:
                 logger.warning(f"Failed to parse agent response: {e}")
                 action = {"name": "_error", "arguments": {"message": str(e)}}
 
+            # Log incoming message with parsed action
+            self.tracer.log_message("assistant", response, parsed_action=action)
+
             # Step the environment
+            step_start = time.time()
             observation, reward, terminated, truncated, info = env.step(action)
+            step_duration = (time.time() - step_start) * 1000  # ms
+
+            # Log tool call
+            tool_name = action.get("name", "unknown")
+            if tool_name != "submit_answer" and tool_name != "_error":
+                self.tracer.log_tool_call(
+                    tool_name=tool_name,
+                    arguments=action.get("arguments", {}),
+                    result=observation,
+                    cost=info.get("cost", 0.0),
+                    duration_ms=step_duration,
+                )
+
             logger.debug(f"Environment step: reward={reward}, terminated={terminated}")
 
             if terminated or truncated:
@@ -247,62 +333,96 @@ Per-Category Results:
 
         # Get final evaluation
         final_result = info.get("evaluation", {})
+        task_time = time.time() - start_time
+
+        # Extract judge costs
+        judge_costs = final_result.get("costs", {})
+        total_cost = info.get("cost", 0.0) + judge_costs.get("total_usd", 0.0)
 
         return {
+            # Legacy format (for backward compatibility)
             "reward": final_result.get("reward", 0.0),
             "factual_accuracy": final_result.get("factual_accuracy", 0.0),
             "has_contradiction": final_result.get("has_contradiction", False),
             "process_quality": final_result.get("process_quality", 0.0),
-            "steps_taken": info.get("step", 0),
-            "cost": info.get("cost", 0.0),
-            "time": time.time() - start_time,
-            "passed": final_result.get("reward", 0.0) >= 0.8,
-            "agent_answer": info.get("agent_answer", ""),
+            "passed": final_result.get("passed", False),
+
+            # Full dual-mode evaluation results
+            "benchmark_mode": final_result.get("benchmark_mode", {}),
+            "rl_mode": final_result.get("rl_mode", {}),
+
+            # Metadata
+            "metadata": {
+                "steps_taken": info.get("step", 0),
+                "time_seconds": task_time,
+                "agent_answer": info.get("agent_answer", ""),
+            },
+
+            # Cost breakdown
+            "costs": {
+                "total_usd": total_cost,
+                "agent_and_tools": info.get("cost", 0.0),
+                "judges": judge_costs.get("total_usd", 0.0),
+                "judges_breakdown": judge_costs.get("judges_breakdown", {}),
+            },
         }
 
     def _build_task_prompt(self, task: Task, info: dict) -> str:
         """Build the initial task prompt for the purple agent."""
         tools_json = json.dumps(get_tool_definitions(), indent=2)
 
-        return f"""You are a financial research agent. Your task is to answer the following question by researching financial data.
-
-QUESTION:
-{task.question}
-
-AVAILABLE TOOLS:
-{tools_json}
-
-INSTRUCTIONS:
-1. Use the available tools to research and gather information
-2. You can search SEC EDGAR filings, search Google, parse web pages, and retrieve information from stored documents
-3. When you have enough information, submit your final answer using the submit_answer tool
-4. Be thorough but efficient - avoid redundant tool calls
-
-RESPONSE FORMAT:
-Respond with a JSON object wrapped in <json>...</json> tags:
-<json>
-{{
-  "name": "tool_name",
-  "arguments": {{...}}
-}}
-</json>
-
-Example responses:
-<json>
-{{"name": "edgar_search", "arguments": {{"query": "revenue", "form_types": ["10-K"], "ciks": [], "start_date": "2023-01-01", "end_date": "2024-12-31", "page": "1", "top_n_results": 5}}}}
-</json>
-
-<json>
-{{"name": "submit_answer", "arguments": {{"answer": "Based on my research..."}}}}
-</json>
-
-Begin your research now.
-"""
+        return format_prompt(
+            "task_prompt",
+            question=task.question,
+            tools_json=tools_json,
+        )
 
     def _parse_agent_response(self, response: str) -> dict:
         """Parse the purple agent's response to extract the action."""
         import re
 
+        # Check for FINAL ANSWER format (final submission)
+        if "FINAL ANSWER:" in response:
+            # Extract answer after "FINAL ANSWER:" up to the sources JSON
+            answer_match = re.search(r'FINAL ANSWER:\s*(.*?)(?=\n\s*\{|$)', response, re.DOTALL)
+            answer = answer_match.group(1).strip() if answer_match else ""
+
+            # Extract sources - handle both JSON and markdown formats
+            sources = []
+
+            # Try JSON format first: { "sources": [...] }
+            json_match = re.search(r'\{[^{}]*"sources"\s*:\s*\[.*?\]\s*[^{}]*\}', response, re.DOTALL)
+            if json_match:
+                try:
+                    sources_dict = json.loads(json_match.group(0))
+                    sources = sources_dict.get("sources", [])
+                    logger.info(f"Parsed {len(sources)} sources from JSON format")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse sources JSON: {e}")
+
+            # If JSON failed, try markdown format: [text](url)
+            if not sources:
+                markdown_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+                markdown_matches = re.findall(markdown_pattern, response)
+                if markdown_matches:
+                    sources = [
+                        {"name": name.strip(), "url": url.strip()}
+                        for name, url in markdown_matches
+                        if url.startswith('http')  # Only include actual URLs
+                    ]
+                    logger.info(f"Parsed {len(sources)} sources from markdown format")
+                else:
+                    logger.warning("No sources found in either JSON or markdown format")
+
+            return {
+                "name": "submit_answer",
+                "arguments": {
+                    "answer": answer,
+                    "sources": sources
+                }
+            }
+
+        # Otherwise parse tool call (existing logic)
         json_str = None
 
         # Try <json>...</json> tags

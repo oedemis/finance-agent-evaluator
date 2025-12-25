@@ -6,6 +6,7 @@ Based on green-agent-template pattern.
 """
 import argparse
 import logging
+import os
 
 import uvicorn
 from starlette.applications import Starlette
@@ -25,6 +26,9 @@ from executor import Executor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("finance_evaluator")
+
+# Phoenix observability (optional)
+_phoenix_observability = None
 
 
 async def health_check(request):
@@ -60,18 +64,46 @@ def create_agent_card(url: str) -> AgentCard:
 
 
 def main():
+    global _phoenix_observability
+
     parser = argparse.ArgumentParser(description="Run the Finance Agent Evaluator.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind")
     parser.add_argument("--port", type=int, default=9009, help="Port to bind")
     parser.add_argument("--card-url", type=str, help="External URL for agent card")
     parser.add_argument("--data-path", type=str, default="data/public.csv", help="Path to dataset")
+    parser.add_argument("--trace-dir", type=str, default="traces", help="Directory to save execution traces")
+    parser.add_argument("--phoenix", action="store_true", help="Enable Phoenix observability")
+    parser.add_argument("--phoenix-endpoint", type=str, default="http://localhost:6006",
+                        help="Phoenix endpoint URL")
+    parser.add_argument("--no-llm-judges", action="store_true",
+                        help="Disable LLM judges (use heuristic evaluation)")
+    parser.add_argument("--judge-model", type=str, default="gpt-4o-mini",
+                        help="Model to use for LLM judges")
     args = parser.parse_args()
+
+    # Initialize Phoenix if requested
+    if args.phoenix:
+        try:
+            from observability import setup_observability
+            _phoenix_observability = setup_observability(
+                project_name="finance-agent-benchmark",
+                endpoint=args.phoenix_endpoint,
+            )
+            if _phoenix_observability:
+                logger.info(f"Phoenix observability enabled. View at {args.phoenix_endpoint}")
+        except Exception as e:
+            logger.warning(f"Could not enable Phoenix: {e}")
 
     agent_url = args.card_url or f"http://{args.host}:{args.port}/"
     agent_card = create_agent_card(agent_url)
 
     request_handler = DefaultRequestHandler(
-        agent_executor=Executor(data_path=args.data_path),
+        agent_executor=Executor(
+            data_path=args.data_path,
+            trace_dir=args.trace_dir,
+            use_llm_judges=not args.no_llm_judges,
+            judge_model=args.judge_model,
+        ),
         task_store=InMemoryTaskStore(),
     )
 
@@ -93,6 +125,10 @@ def main():
 
     logger.info(f"Starting Finance Evaluator on {args.host}:{args.port}")
     logger.info(f"Health check: http://{args.host}:{args.port}/health")
+    logger.info(f"Traces will be saved to: {args.trace_dir}/")
+    logger.info(f"LLM Judges: {'enabled' if not args.no_llm_judges else 'disabled'}")
+    if not args.no_llm_judges:
+        logger.info(f"Judge model: {args.judge_model}")
 
     uvicorn.run(app, host=args.host, port=args.port)
 

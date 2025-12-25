@@ -32,9 +32,18 @@ TERMINAL_STATES = {
 class Executor(AgentExecutor):
     """AgentExecutor that manages FinanceEvaluatorAgent instances."""
 
-    def __init__(self, data_path: str = "data/public.csv"):
+    def __init__(
+        self,
+        data_path: str = "data/public.csv",
+        trace_dir: str | None = None,
+        use_llm_judges: bool = True,
+        judge_model: str = "gpt-4o-mini",
+    ):
         self.agents: dict[str, FinanceEvaluatorAgent] = {}
         self.data_path = data_path
+        self.trace_dir = trace_dir
+        self.use_llm_judges = use_llm_judges
+        self.judge_model = judge_model
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         msg = context.message
@@ -56,7 +65,12 @@ class Executor(AgentExecutor):
         context_id = task.context_id
         agent = self.agents.get(context_id)
         if not agent:
-            agent = FinanceEvaluatorAgent(data_path=self.data_path)
+            agent = FinanceEvaluatorAgent(
+                data_path=self.data_path,
+                trace_dir=self.trace_dir,
+                use_llm_judges=self.use_llm_judges,
+                judge_model=self.judge_model,
+            )
             self.agents[context_id] = agent
 
         updater = TaskUpdater(event_queue, task.id, context_id)

@@ -1,0 +1,78 @@
+You are an expert analyst checking for ACTUAL CONTRADICTIONS in a research agent's answer.
+
+CRITICAL: This is a LENIENT check to REDUCE FALSE NEGATIVES (correct answers marked as wrong).
+
+TASK: Check if the agent's answer contains information that CONTRADICTS the expected answer.
+
+QUESTION:
+{question}
+
+EXPECTED ANSWER (Semantic Anchor):
+{expected_answer}
+
+AGENT'S FINAL ANSWER:
+{agent_answer}
+
+=== LENIENT CHECKING GUIDELINES ===
+
+DO NOT flag as contradictions:
+✓ Different wording or phrasing (OK if semantically equivalent)
+✓ Different sentence structure or organization (OK)
+✓ Additional context or supporting details (OK)
+✓ More specific or more general statements (OK if not contradictory)
+✓ Information stated in a different order (OK)
+
+ONLY flag as contradictions:
+✗ Wrong numbers or financial figures (e.g., $7B vs $14B)
+✗ Opposite claims (e.g., "merger approved" vs "merger rejected")
+✗ Wrong dates or timelines (e.g., 2023 vs 2024)
+✗ Wrong entity names (e.g., Company A vs Company B)
+✗ Contradictory statements about outcomes or events
+
+=== CONTRADICTION TYPES TO CHECK ===
+
+1. FACTUAL CONTRADICTIONS vs EXPECTED ANSWER:
+   - Agent states facts that directly contradict the expected answer
+   - Wrong numbers, dates, names, or outcomes
+   - This is the PRIMARY contradiction type to detect
+
+2. INTERNAL CONTRADICTIONS:
+   - Agent contradicts itself within the final answer
+   - Example: "Revenue increased 20%" then "Revenue declined"
+
+3. NUMERICAL CONTRADICTIONS:
+   - Wrong financial figures compared to expected answer
+   - Example: Expected "$14.9 billion", Agent says "$7.3 billion"
+
+4. TEMPORAL CONTRADICTIONS:
+   - Wrong dates or timelines compared to expected answer
+   - Example: Expected "2024", Agent says "2023"
+
+5. OUTCOME CONTRADICTIONS:
+   - Agent states opposite outcome from expected answer
+   - Example: Expected "merger blocked", Agent says "merger approved"
+
+=== SEVERITY LEVELS ===
+
+- CRITICAL: Completely opposite facts (approved vs rejected, increase vs decrease)
+- MAJOR: Wrong key numbers or dates (off by significant amounts)
+- MINOR: Small inaccuracies that don't change the overall meaning
+- NONE: No contradictions found (different wording is OK)
+
+Respond with a JSON object:
+```json
+{{
+  "has_contradiction": <true or false>,
+  "contradiction_type": "<type or null if none>",
+  "severity": "<critical|major|minor|none>",
+  "contradictions_found": [
+    {{
+      "type": "<contradiction type>",
+      "statement_1": "<first statement>",
+      "statement_2": "<contradicting statement>",
+      "explanation": "<why these contradict>"
+    }}
+  ],
+  "reasoning": "<overall assessment>"
+}}
+```

@@ -54,3 +54,6 @@ Thumbs.db
 data/private.csv
 results/
 trajectories/
+
+# Python version management
+.python-version

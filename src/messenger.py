@@ -2,6 +2,7 @@
 Messenger for A2A agent communication.
 
 Based on green-agent-template pattern.
+Includes OpenTelemetry tracing for Phoenix observability.
 """
 import json
 from uuid import uuid4
@@ -19,6 +20,23 @@ from a2a.types import (
     TextPart,
     DataPart,
 )
+
+# Optional OpenTelemetry tracing with OpenInference semantic conventions
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind, Status, StatusCode
+    _tracer = trace.get_tracer("finance_evaluator.a2a")
+    _HAS_OTEL = True
+
+    # OpenInference semantic conventions for better Phoenix display
+    # See: https://github.com/Arize-ai/openinference
+    INPUT_VALUE = "input.value"
+    OUTPUT_VALUE = "output.value"
+    OPENINFERENCE_SPAN_KIND = "openinference.span.kind"
+except ImportError:
+    _HAS_OTEL = False
+    _tracer = None
+    INPUT_VALUE = OUTPUT_VALUE = OPENINFERENCE_SPAN_KIND = None
 
 
 DEFAULT_TIMEOUT = 300
@@ -117,16 +135,57 @@ class Messenger:
         Returns:
             str: The agent's response
         """
-        outputs = await send_message(
-            message=message,
-            base_url=url,
-            context_id=None if new_conversation else self._context_ids.get(url, None),
-            timeout=timeout,
-        )
-        if outputs.get("status", "completed") != "completed":
-            raise RuntimeError(f"{url} responded with: {outputs}")
-        self._context_ids[url] = outputs.get("context_id", None)
-        return outputs["response"]
+        # Create OpenTelemetry span for A2A communication if available
+        if _HAS_OTEL and _tracer:
+            with _tracer.start_as_current_span(
+                "A2A Agent Communication",
+                kind=SpanKind.CLIENT,
+                attributes={
+                    OPENINFERENCE_SPAN_KIND: "CHAIN",  # Mark as chain for Phoenix
+                    "a2a.target_url": url,
+                    "a2a.new_conversation": new_conversation,
+                    # Use OpenInference input.value for Phoenix display
+                    INPUT_VALUE: message[:2000] if message else "",
+                }
+            ) as span:
+                try:
+                    outputs = await send_message(
+                        message=message,
+                        base_url=url,
+                        context_id=None if new_conversation else self._context_ids.get(url, None),
+                        timeout=timeout,
+                    )
+                    response = outputs.get("response", "")
+
+                    # Use OpenInference output.value for Phoenix display
+                    span.set_attribute(OUTPUT_VALUE, response[:2000] if response else "")
+                    span.set_attribute("a2a.context_id", outputs.get("context_id", "") or "")
+                    span.set_attribute("a2a.status", outputs.get("status", "completed"))
+
+                    if outputs.get("status", "completed") != "completed":
+                        span.set_status(Status(StatusCode.ERROR, f"Agent returned: {outputs.get('status')}"))
+                        raise RuntimeError(f"{url} responded with: {outputs}")
+
+                    span.set_status(Status(StatusCode.OK))
+                    self._context_ids[url] = outputs.get("context_id", None)
+                    return response
+
+                except Exception as e:
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                    span.record_exception(e)
+                    raise
+        else:
+            # No tracing available
+            outputs = await send_message(
+                message=message,
+                base_url=url,
+                context_id=None if new_conversation else self._context_ids.get(url, None),
+                timeout=timeout,
+            )
+            if outputs.get("status", "completed") != "completed":
+                raise RuntimeError(f"{url} responded with: {outputs}")
+            self._context_ids[url] = outputs.get("context_id", None)
+            return outputs["response"]
 
     def reset(self):
         """Reset conversation contexts."""
