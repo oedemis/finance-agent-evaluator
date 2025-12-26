@@ -274,11 +274,9 @@ class FinanceEvaluatorAgent:
             judge_model=self.judge_model,
         )
 
-        # Register environment with MCP server for tool routing
-        # Use task.id as context_id for state isolation
-        context_id = task.id
-        await register_environment(context_id, env)
-        logger.info(f"Registered environment for task {task.id}")
+        # We'll register the environment AFTER the first A2A message exchange
+        # so we have the correct context_id from the A2A conversation
+        context_id = None  # Will be set after first message
 
         try:
             terminated = False
@@ -308,6 +306,18 @@ class FinanceEvaluatorAgent:
                     url=agent_url,
                     new_conversation=is_first_message,
                 )
+
+                # After first message, register environment with A2A context_id
+                if is_first_message:
+                    # Get the A2A context_id from the messenger (set after first response)
+                    context_id = self.messenger._context_ids.get(agent_url)
+                    if not context_id:
+                        raise RuntimeError(f"Failed to get A2A context_id from purple agent")
+
+                    # Register environment with MCP server using the A2A context_id
+                    await register_environment(context_id, env)
+                    logger.info(f"Registered environment for task {task.id} with A2A context_id: {context_id}")
+
                 is_first_message = False
 
                 logger.debug(f"Purple agent response: {response[:200]}...")
@@ -392,9 +402,10 @@ class FinanceEvaluatorAgent:
             }
 
         finally:
-            # Cleanup: unregister environment from MCP server
-            await unregister_environment(context_id)
-            logger.info(f"Unregistered environment for task {task.id}")
+            # Cleanup: unregister environment from MCP server (only if it was registered)
+            if context_id:
+                await unregister_environment(context_id)
+                logger.info(f"Unregistered environment for task {task.id} (context: {context_id})")
 
     def _build_task_prompt(self, task: Task, info: dict) -> str:
         """Build the initial task prompt for the purple agent."""
