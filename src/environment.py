@@ -99,6 +99,13 @@ class FinancialResearchEnv(gym.Env):
         self.trajectory: list[dict] = []
         self.tool_calls: list[dict] = []  # Track tool calls for process evaluation
 
+        # Last step results (for MCP proxy pattern - allows retrieving results without re-stepping)
+        self._last_observation: Optional[str] = None
+        self._last_reward: float = 0.0
+        self._last_terminated: bool = False
+        self._last_truncated: bool = False
+        self._last_info: dict = {}
+
         # Define action and observation spaces
         # Action space: JSON string representing tool call
         self.action_space = spaces.Text(max_length=10000)
@@ -190,6 +197,13 @@ class FinancialResearchEnv(gym.Env):
                 "reward": reward,
                 "terminated": True,
             })
+
+            # Store last step results (for MCP proxy pattern)
+            self._last_observation = observation
+            self._last_reward = reward
+            self._last_terminated = True
+            self._last_truncated = False
+            self._last_info = info
 
             return observation, reward, True, False, info
 
@@ -318,6 +332,13 @@ class FinancialResearchEnv(gym.Env):
             "reward": intermediate_reward,
         })
 
+        # Store last step results (for MCP proxy pattern)
+        self._last_observation = observation
+        self._last_reward = intermediate_reward
+        self._last_terminated = False
+        self._last_truncated = truncated
+        self._last_info = info
+
         return observation, intermediate_reward, False, truncated, info
 
     def _build_observation(
@@ -340,12 +361,8 @@ class FinancialResearchEnv(gym.Env):
             }
         }
 
-        # Add instruction based on type
-        if obs_type == "tool_result":
-            obs["next_step"] = "Continue research or submit your final answer using FINAL ANSWER: format."
-        elif obs_type == "error":
-            obs["next_step"] = "Please fix the issue and try again."
-
+        # Format instructions removed - purple agents discover tools via MCP
+        # No need to tell them how to submit answers
         return json.dumps(obs, indent=2)
 
     def _handle_error(self, message: str) -> str:

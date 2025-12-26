@@ -22,6 +22,7 @@ from environment import FinancialResearchEnv, register_finance_env
 from tools import get_tool_definitions
 from tracer import TraceLogger
 from prompts import format_prompt
+from mcp_server import register_environment, unregister_environment
 
 logger = logging.getLogger("finance_evaluator")
 
@@ -47,12 +48,14 @@ class FinanceEvaluatorAgent:
         trace_dir: Optional[str] = None,
         use_llm_judges: bool = True,
         judge_model: str = "gpt-4o-mini",
+        debug_a2a: bool = False,
     ):
-        self.messenger = Messenger()
+        self.messenger = Messenger(debug_mode=debug_a2a)
         self.dataset = DatasetLoader(data_path)
         self.tracer = TraceLogger(output_dir=trace_dir)
         self.use_llm_judges = use_llm_judges
         self.judge_model = judge_model
+        self.debug_a2a = debug_a2a
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
         """Validate the evaluation request."""
@@ -146,6 +149,10 @@ class FinanceEvaluatorAgent:
                     category=task.category,
                     expert_answer=task.expert_answer,
                 )
+
+                # Set trace for A2A message logging
+                if self.debug_a2a:
+                    self.messenger.set_trace(self.tracer.current_task)
 
                 try:
                     task_result = await self._run_single_task(
@@ -267,105 +274,127 @@ class FinanceEvaluatorAgent:
             judge_model=self.judge_model,
         )
 
-        terminated = False
-        truncated = False
-        observation, info = env.reset()
+        # Register environment with MCP server for tool routing
+        # Use task.id as context_id for state isolation
+        context_id = task.id
+        await register_environment(context_id, env)
+        logger.info(f"Registered environment for task {task.id}")
 
-        # Build the initial task prompt
-        task_prompt = self._build_task_prompt(task, info)
+        try:
+            terminated = False
+            truncated = False
+            observation, info = env.reset()
 
-        next_message = task_prompt
-        is_first_message = True
-        start_time = time.time()
+            # Build the initial task prompt
+            task_prompt = self._build_task_prompt(task, info)
 
-        while not terminated and not truncated:
-            if time.time() - start_time > timeout:
-                truncated = True
-                break
+            next_message = task_prompt
+            is_first_message = True
+            start_time = time.time()
 
-            logger.debug(f"Sending to purple agent: {next_message[:200]}...")
+            while not terminated and not truncated:
+                if time.time() - start_time > timeout:
+                    truncated = True
+                    break
 
-            # Log outgoing message
-            self.tracer.log_message("user", next_message)
+                logger.debug(f"Sending to purple agent: {next_message[:200]}...")
 
-            # Send message to purple agent
-            response = await self.messenger.talk_to_agent(
-                message=next_message,
-                url=agent_url,
-                new_conversation=is_first_message,
-            )
-            is_first_message = False
+                # Log outgoing message
+                self.tracer.log_message("user", next_message)
 
-            logger.debug(f"Purple agent response: {response[:200]}...")
-
-            # Parse the action
-            try:
-                action = self._parse_agent_response(response)
-            except Exception as e:
-                logger.warning(f"Failed to parse agent response: {e}")
-                action = {"name": "_error", "arguments": {"message": str(e)}}
-
-            # Log incoming message with parsed action
-            self.tracer.log_message("assistant", response, parsed_action=action)
-
-            # Step the environment
-            step_start = time.time()
-            observation, reward, terminated, truncated, info = env.step(action)
-            step_duration = (time.time() - step_start) * 1000  # ms
-
-            # Log tool call
-            tool_name = action.get("name", "unknown")
-            if tool_name != "submit_answer" and tool_name != "_error":
-                self.tracer.log_tool_call(
-                    tool_name=tool_name,
-                    arguments=action.get("arguments", {}),
-                    result=observation,
-                    cost=info.get("cost", 0.0),
-                    duration_ms=step_duration,
+                # Send message to purple agent
+                response, artifacts = await self.messenger.talk_to_agent(
+                    message=next_message,
+                    url=agent_url,
+                    new_conversation=is_first_message,
                 )
+                is_first_message = False
 
-            logger.debug(f"Environment step: reward={reward}, terminated={terminated}")
+                logger.debug(f"Purple agent response: {response[:200]}...")
 
-            if terminated or truncated:
-                break
+                # Extract answer data from A2A artifacts (MCP mode - no text parsing)
+                # The purple agent returns structured data as DataPart when submit_answer is called
+                from a2a.types import DataPart as A2ADataPart
 
-            next_message = observation
+                # Check artifacts for structured answer data
+                answer_submitted = False
+                if artifacts:
+                    for artifact in artifacts:
+                        for part in artifact.parts:
+                            if isinstance(part.root, A2ADataPart):
+                                # Found structured data - this is the final answer
+                                answer_data = part.root.data
+                                if isinstance(answer_data, dict) and "answer" in answer_data:
+                                    answer_submitted = True
+                                    logger.info(f"Purple agent submitted final answer")
+                                    break
+                        if answer_submitted:
+                            break
 
-        # Get final evaluation
-        final_result = info.get("evaluation", {})
-        task_time = time.time() - start_time
+                # With MCP proxy pattern, purple agent calls tools directly via MCP
+                # Each MCP tool call routes to env.step() automatically
+                # So we don't need to call env.step() here - just check if the task is done
 
-        # Extract judge costs
-        judge_costs = final_result.get("costs", {})
-        total_cost = info.get("cost", 0.0) + judge_costs.get("total_usd", 0.0)
+                if answer_submitted:
+                    # Purple agent called submit_answer via MCP (which already called env.step())
+                    # Retrieve the final state from the environment (no double-step)
+                    terminated = env._last_terminated
+                    truncated = env._last_truncated
+                    logger.info(f"Task completed: terminated={terminated}, truncated={truncated}")
+                    break
 
-        return {
-            # Legacy format (for backward compatibility)
-            "reward": final_result.get("reward", 0.0),
-            "factual_accuracy": final_result.get("factual_accuracy", 0.0),
-            "has_contradiction": final_result.get("has_contradiction", False),
-            "process_quality": final_result.get("process_quality", 0.0),
-            "passed": final_result.get("passed", False),
+                # Check if environment was truncated (max steps reached via MCP calls)
+                if env._last_truncated:
+                    logger.warning(f"Task truncated: max steps reached")
+                    truncated = True
+                    break
 
-            # Full dual-mode evaluation results
-            "benchmark_mode": final_result.get("benchmark_mode", {}),
-            "rl_mode": final_result.get("rl_mode", {}),
+                # Purple agent is still working - this shouldn't happen in MCP mode
+                # because purple agent loops internally and only returns when done
+                logger.warning("Purple agent returned without submitting answer (unexpected in MCP mode)")
+                next_message = "Please continue your research or submit your final answer."
 
-            # Metadata
-            "metadata": {
-                "steps_taken": info.get("step", 0),
-                "time_seconds": task_time,
-                "agent_answer": info.get("agent_answer", ""),
-            },
+            # Get final evaluation from environment's last step result
+            info = env._last_info
+            final_result = info.get("evaluation", {})
+            task_time = time.time() - start_time
 
-            # Cost breakdown
-            "costs": {
-                "total_usd": total_cost,
-                "agent_and_tools": info.get("cost", 0.0),
-                "judges": judge_costs.get("total_usd", 0.0),
-                "judges_breakdown": judge_costs.get("judges_breakdown", {}),
-            },
-        }
+            # Extract judge costs
+            judge_costs = final_result.get("costs", {})
+            total_cost = info.get("cost", 0.0) + judge_costs.get("total_usd", 0.0)
+
+            return {
+                # Legacy format (for backward compatibility)
+                "reward": final_result.get("reward", 0.0),
+                "factual_accuracy": final_result.get("factual_accuracy", 0.0),
+                "has_contradiction": final_result.get("has_contradiction", False),
+                "process_quality": final_result.get("process_quality", 0.0),
+                "passed": final_result.get("passed", False),
+
+                # Full dual-mode evaluation results
+                "benchmark_mode": final_result.get("benchmark_mode", {}),
+                "rl_mode": final_result.get("rl_mode", {}),
+
+                # Metadata
+                "metadata": {
+                    "steps_taken": info.get("step", 0),
+                    "time_seconds": task_time,
+                    "agent_answer": info.get("agent_answer", ""),
+                },
+
+                # Cost breakdown
+                "costs": {
+                    "total_usd": total_cost,
+                    "agent_and_tools": info.get("cost", 0.0),
+                    "judges": judge_costs.get("total_usd", 0.0),
+                    "judges_breakdown": judge_costs.get("judges_breakdown", {}),
+                },
+            }
+
+        finally:
+            # Cleanup: unregister environment from MCP server
+            await unregister_environment(context_id)
+            logger.info(f"Unregistered environment for task {task.id}")
 
     def _build_task_prompt(self, task: Task, info: dict) -> str:
         """Build the initial task prompt for the purple agent."""
@@ -377,69 +406,3 @@ class FinanceEvaluatorAgent:
             tools_json=tools_json,
         )
 
-    def _parse_agent_response(self, response: str) -> dict:
-        """Parse the purple agent's response to extract the action."""
-        import re
-
-        # Check for FINAL ANSWER format (final submission)
-        if "FINAL ANSWER:" in response:
-            # Extract answer after "FINAL ANSWER:" up to the sources JSON
-            answer_match = re.search(r'FINAL ANSWER:\s*(.*?)(?=\n\s*\{|$)', response, re.DOTALL)
-            answer = answer_match.group(1).strip() if answer_match else ""
-
-            # Extract sources - handle both JSON and markdown formats
-            sources = []
-
-            # Try JSON format first: { "sources": [...] }
-            json_match = re.search(r'\{[^{}]*"sources"\s*:\s*\[.*?\]\s*[^{}]*\}', response, re.DOTALL)
-            if json_match:
-                try:
-                    sources_dict = json.loads(json_match.group(0))
-                    sources = sources_dict.get("sources", [])
-                    logger.info(f"Parsed {len(sources)} sources from JSON format")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse sources JSON: {e}")
-
-            # If JSON failed, try markdown format: [text](url)
-            if not sources:
-                markdown_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
-                markdown_matches = re.findall(markdown_pattern, response)
-                if markdown_matches:
-                    sources = [
-                        {"name": name.strip(), "url": url.strip()}
-                        for name, url in markdown_matches
-                        if url.startswith('http')  # Only include actual URLs
-                    ]
-                    logger.info(f"Parsed {len(sources)} sources from markdown format")
-                else:
-                    logger.warning("No sources found in either JSON or markdown format")
-
-            return {
-                "name": "submit_answer",
-                "arguments": {
-                    "answer": answer,
-                    "sources": sources
-                }
-            }
-
-        # Otherwise parse tool call (existing logic)
-        json_str = None
-
-        # Try <json>...</json> tags
-        match = re.search(r'<json>\s*(.*?)\s*</json>', response, re.DOTALL)
-        if match:
-            json_str = match.group(1)
-        else:
-            # Try markdown code blocks
-            match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
-            if match:
-                json_str = match.group(1)
-            else:
-                match = re.search(r'```\s*(.*?)\s*```', response, re.DOTALL)
-                if match:
-                    json_str = match.group(1)
-
-        if json_str:
-            return json.loads(json_str)
-        else:
-            return json.loads(response)
