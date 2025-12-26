@@ -274,9 +274,17 @@ class FinanceEvaluatorAgent:
             judge_model=self.judge_model,
         )
 
-        # We'll register the environment AFTER the first A2A message exchange
-        # so we have the correct context_id from the A2A conversation
-        context_id = None  # Will be set after first message
+        # Generate context_id upfront and register environment BEFORE sending message
+        # This prevents race condition where purple agent starts calling MCP tools
+        # before green agent has a chance to register the environment
+        from uuid import uuid4
+        context_id = str(uuid4())
+
+        await register_environment(context_id, env)
+        logger.info(f"Registered environment for task {task.id} with context_id: {context_id}")
+
+        # Store context_id in messenger so it uses this for the conversation
+        self.messenger._context_ids[agent_url] = context_id
 
         try:
             terminated = False
@@ -301,22 +309,12 @@ class FinanceEvaluatorAgent:
                 self.tracer.log_message("user", next_message)
 
                 # Send message to purple agent
+                # Pass new_conversation=False even on first message since we already set context_id
                 response, artifacts = await self.messenger.talk_to_agent(
                     message=next_message,
                     url=agent_url,
                     new_conversation=is_first_message,
                 )
-
-                # After first message, register environment with A2A context_id
-                if is_first_message:
-                    # Get the A2A context_id from the messenger (set after first response)
-                    context_id = self.messenger._context_ids.get(agent_url)
-                    if not context_id:
-                        raise RuntimeError(f"Failed to get A2A context_id from purple agent")
-
-                    # Register environment with MCP server using the A2A context_id
-                    await register_environment(context_id, env)
-                    logger.info(f"Registered environment for task {task.id} with A2A context_id: {context_id}")
 
                 is_first_message = False
 
@@ -348,13 +346,15 @@ class FinanceEvaluatorAgent:
                 if answer_submitted:
                     # Purple agent called submit_answer via MCP (which already called env.step())
                     # Retrieve the final state from the environment (no double-step)
-                    terminated = env._last_terminated
-                    truncated = env._last_truncated
+                    # Access unwrapped environment to get our custom attributes
+                    unwrapped_env = env.unwrapped
+                    terminated = unwrapped_env._last_terminated
+                    truncated = unwrapped_env._last_truncated
                     logger.info(f"Task completed: terminated={terminated}, truncated={truncated}")
                     break
 
                 # Check if environment was truncated (max steps reached via MCP calls)
-                if env._last_truncated:
+                if env.unwrapped._last_truncated:
                     logger.warning(f"Task truncated: max steps reached")
                     truncated = True
                     break
@@ -365,7 +365,8 @@ class FinanceEvaluatorAgent:
                 next_message = "Please continue your research or submit your final answer."
 
             # Get final evaluation from environment's last step result
-            info = env._last_info
+            # Access unwrapped environment to get our custom attributes
+            info = env.unwrapped._last_info
             final_result = info.get("evaluation", {})
             task_time = time.time() - start_time
 

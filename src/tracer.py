@@ -24,6 +24,15 @@ class ToolCall:
 
 
 @dataclass
+class A2AProtocolMessage:
+    """Raw A2A protocol message for debugging."""
+    direction: str  # "sent" or "received"
+    message_type: str  # "request", "response", "event", etc.
+    payload: dict  # Full JSON-RPC message
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+@dataclass
 class AgentMessage:
     """A message from the purple agent."""
     step: int
@@ -44,6 +53,7 @@ class TaskTrace:
     # Execution trace
     messages: list[AgentMessage] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
+    a2a_protocol_messages: list[A2AProtocolMessage] = field(default_factory=list)
 
     # Final results
     agent_answer: str = ""
@@ -83,6 +93,14 @@ class TaskTrace:
             result=result[:10000],  # Truncate long results
             cost=cost,
             duration_ms=duration_ms,
+        ))
+
+    def add_a2a_message(self, direction: str, message_type: str, payload: dict):
+        """Add an A2A protocol message to the trace for debugging."""
+        self.a2a_protocol_messages.append(A2AProtocolMessage(
+            direction=direction,
+            message_type=message_type,
+            payload=payload,
         ))
 
     def complete(self, result: dict):
@@ -129,7 +147,7 @@ class TaskTrace:
             "passed": self.passed,
         }
 
-        return {
+        result = {
             "task_id": self.task_id,
             "question": self.question,
             "category": self.category,
@@ -149,6 +167,12 @@ class TaskTrace:
             },
             "error": self.error,
         }
+
+        # Include A2A protocol messages if available (for debugging)
+        if self.a2a_protocol_messages:
+            result["a2a_protocol_messages"] = [asdict(m) for m in self.a2a_protocol_messages]
+
+        return result
 
 
 @dataclass

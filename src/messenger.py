@@ -84,7 +84,7 @@ async def send_message(
 
         outbound_msg = create_message(text=message, context_id=context_id)
         last_event = None
-        outputs = {"response": "", "context_id": None}
+        outputs = {"response": "", "context_id": None, "artifacts": []}
 
         async for event in client.send_message(outbound_msg):
             last_event = event
@@ -101,6 +101,7 @@ async def send_message(
                 if msg:
                     outputs["response"] += merge_parts(msg.parts)
                 if task.artifacts:
+                    outputs["artifacts"] = task.artifacts  # Store artifacts for structured data access
                     for artifact in task.artifacts:
                         outputs["response"] += merge_parts(artifact.parts)
 
@@ -113,8 +114,14 @@ async def send_message(
 class Messenger:
     """Helper class for A2A agent-to-agent communication."""
 
-    def __init__(self):
+    def __init__(self, debug_mode: bool = False):
         self._context_ids = {}
+        self.debug_mode = debug_mode
+        self.current_trace = None  # Will be set per task
+
+    def set_trace(self, trace):
+        """Set the current task trace for A2A message logging."""
+        self.current_trace = trace
 
     async def talk_to_agent(
         self,
@@ -122,7 +129,7 @@ class Messenger:
         url: str,
         new_conversation: bool = False,
         timeout: int = DEFAULT_TIMEOUT,
-    ) -> str:
+    ) -> tuple[str, list]:
         """
         Communicate with another agent.
 
@@ -133,8 +140,20 @@ class Messenger:
             timeout: Timeout in seconds (default: 300)
 
         Returns:
-            str: The agent's response
+            tuple: (response_text, artifacts) - text response and list of Artifact objects
         """
+        # Log outbound A2A message if debugging enabled
+        if self.debug_mode and self.current_trace:
+            self.current_trace.add_a2a_message(
+                direction="sent",
+                message_type="agent_request",
+                payload={
+                    "url": url,
+                    "message": message[:1000],  # Truncate for readability
+                    "new_conversation": new_conversation,
+                }
+            )
+
         # Create OpenTelemetry span for A2A communication if available
         if _HAS_OTEL and _tracer:
             with _tracer.start_as_current_span(
@@ -168,7 +187,21 @@ class Messenger:
 
                     span.set_status(Status(StatusCode.OK))
                     self._context_ids[url] = outputs.get("context_id", None)
-                    return response
+
+                    # Log inbound A2A message if debugging enabled
+                    if self.debug_mode and self.current_trace:
+                        self.current_trace.add_a2a_message(
+                            direction="received",
+                            message_type="agent_response",
+                            payload={
+                                "url": url,
+                                "response": response[:1000],  # Truncate
+                                "context_id": outputs.get("context_id", ""),
+                                "status": outputs.get("status", "completed"),
+                            }
+                        )
+
+                    return response, outputs.get("artifacts", [])
 
                 except Exception as e:
                     span.set_status(Status(StatusCode.ERROR, str(e)))
@@ -185,7 +218,23 @@ class Messenger:
             if outputs.get("status", "completed") != "completed":
                 raise RuntimeError(f"{url} responded with: {outputs}")
             self._context_ids[url] = outputs.get("context_id", None)
-            return outputs["response"]
+
+            response = outputs["response"]
+
+            # Log inbound A2A message if debugging enabled (non-tracing path)
+            if self.debug_mode and self.current_trace:
+                self.current_trace.add_a2a_message(
+                    direction="received",
+                    message_type="agent_response",
+                    payload={
+                        "url": url,
+                        "response": response[:1000],  # Truncate
+                        "context_id": outputs.get("context_id", ""),
+                        "status": outputs.get("status", "completed"),
+                    }
+                )
+
+            return response, outputs.get("artifacts", [])
 
     def reset(self):
         """Reset conversation contexts."""

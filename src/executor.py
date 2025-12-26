@@ -38,12 +38,14 @@ class Executor(AgentExecutor):
         trace_dir: str | None = None,
         use_llm_judges: bool = True,
         judge_model: str = "gpt-4o-mini",
+        debug_a2a: bool = False,
     ):
         self.agents: dict[str, FinanceEvaluatorAgent] = {}
         self.data_path = data_path
         self.trace_dir = trace_dir
         self.use_llm_judges = use_llm_judges
         self.judge_model = judge_model
+        self.debug_a2a = debug_a2a
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         msg = context.message
@@ -70,6 +72,7 @@ class Executor(AgentExecutor):
                 trace_dir=self.trace_dir,
                 use_llm_judges=self.use_llm_judges,
                 judge_model=self.judge_model,
+                debug_a2a=self.debug_a2a,
             )
             self.agents[context_id] = agent
 

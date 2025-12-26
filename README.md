@@ -17,14 +17,33 @@ The Finance Agent Evaluator is a green agent that evaluates purple agents (finan
 
 ## Architecture
 
+The Finance Agent Evaluator runs **dual servers** for clean separation of concerns:
+
 ```
-Green Agent Components:
-├─ Orchestrator          # Main coordinator
-├─ Gymnasium Environment # Financial research simulation
-├─ Evaluation System     # Judges + Metrics
-├─ Tools                 # EDGAR, Google Search, HTML Parser
-└─ Metrics Aggregator    # Results aggregation
+Green Agent (Dual Server Architecture):
+├─ A2A Server (Port 9009)          # Task/conversation management
+│  ├─ Orchestrator                 # Main coordinator
+│  ├─ Gymnasium Environment        # Financial research simulation
+│  ├─ Evaluation System            # Judges + Metrics
+│  └─ Metrics Aggregator           # Results aggregation
+│
+└─ MCP Server (Port 9020)          # Tool exposure for purple agents
+   ├─ edgar_search                 # SEC EDGAR database search
+   ├─ google_web_search            # Web search via SerpAPI
+   ├─ parse_html_page              # HTML content extraction
+   ├─ retrieve_information         # LLM-based information retrieval
+   └─ submit_answer                # Final answer submission
 ```
+
+**Protocol Usage:**
+- **A2A (Agent-to-Agent)**: Task assignment, progress tracking, results collection
+- **MCP (Model Context Protocol)**: Tool discovery and execution
+
+**Benefits:**
+- Purple agents can use **any architecture** (no text format requirements)
+- Purple agents discover tools via standard MCP protocol
+- Clean separation: A2A for conversations, MCP for tools
+- Supports 1000s of diverse purple agent implementations
 
 ## Installation
 
@@ -61,13 +80,15 @@ SEC_EDGAR_API_KEY=your_sec_key        # For EDGAR search
 ### Run Locally
 
 ```bash
-uv run python src/server.py --host 127.0.0.1 --port 9009
+# Run both A2A and MCP servers
+uv run python src/server.py --host 127.0.0.1 --port 9009 --mcp-port 9020
 ```
 
 **CLI Options:**
 ```
 --host HOST           Host to bind (default: 127.0.0.1)
---port PORT           Port to bind (default: 9009)
+--port PORT           A2A server port (default: 9009)
+--mcp-port PORT       MCP server port (default: 9020, 0 to disable)
 --card-url URL        External URL for agent card
 --data-path PATH      Path to dataset (default: data/public.csv)
 --trace-dir DIR       Directory to save execution traces (default: traces)
@@ -75,7 +96,13 @@ uv run python src/server.py --host 127.0.0.1 --port 9009
 --phoenix-endpoint    Phoenix endpoint URL (default: http://localhost:6006)
 --no-llm-judges       Disable LLM judges (use heuristic evaluation)
 --judge-model MODEL   Model to use for LLM judges (default: gpt-4o-mini)
+--debug-a2a           Log all A2A protocol messages to trace files
 ```
+
+**Server Endpoints:**
+- A2A Server: `http://localhost:9009/` - Task management
+- MCP Server: `http://localhost:9020/mcp` - Tool access for purple agents
+- Health Check: `http://localhost:9009/health`
 
 ### With Phoenix Observability
 
@@ -140,11 +167,34 @@ See `../FAB/scenario.toml` for configuration.
 - Time Tracking: Seconds per task
 - Trajectory Stats: Tool usage, redundancy, coverage
 
-### 4. Tools
-- `search_edgar`: SEC EDGAR database search
-- `search_google`: Web search via SerpAPI
-- `parse_html`: HTML content extraction
-- `retrieve_information`: LLM-based information retrieval
+### 4. MCP Tools (Exposed to Purple Agents)
+
+The green agent exposes 5 tools via the MCP server that purple agents can discover and call:
+
+1. **edgar_search** - Search SEC EDGAR database for company filings
+   - Arguments: `query`, `form_types` (optional), `ciks` (optional), `start_date` (optional), `end_date` (optional), `page`, `top_n_results`
+   - Returns: Search results with filing URLs
+
+2. **google_web_search** - Search the web using Google (SerpAPI)
+   - Arguments: `search_query`
+   - Returns: Web search results with URLs
+
+3. **parse_html_page** - Parse HTML content from a URL and store for later retrieval
+   - Arguments: `url`, `key` (storage key for later reference)
+   - Returns: Success confirmation
+
+4. **retrieve_information** - Extract information from stored documents using LLM
+   - Arguments: `prompt` (use `{{key}}` placeholders to reference stored content)
+   - Returns: Extracted information
+
+5. **submit_answer** - Submit final answer (ends the task)
+   - Arguments: `answer` (comprehensive answer text), `sources` (list of `{"url": "...", "name": "..."}`)
+   - Returns: Submission confirmation
+
+**State Management:**
+- Each purple agent conversation gets isolated storage via `context_id`
+- `parse_html_page` stores content, `retrieve_information` retrieves it
+- State persists across tool calls within a single task
 
 ## Dataset
 
@@ -179,7 +229,8 @@ Question,Answer,Question Type,Expert time (mins),Rubric
 ```
 finance-agent-evaluator/
 ├── src/
-│   ├── server.py             # Main entry point (A2A server)
+│   ├── server.py             # Main entry point (A2A + MCP servers)
+│   ├── mcp_server.py         # MCP server (tool exposure via FastMCP)
 │   ├── executor.py           # AgentExecutor (manages agent instances)
 │   ├── agent.py              # FinanceEvaluatorAgent (evaluation logic)
 │   ├── messenger.py          # A2A client for purple agent communication
