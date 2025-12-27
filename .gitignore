@@ -57,3 +57,6 @@ trajectories/
 
 # Python version management
 .python-version
+
+# Local deployment docs
+DEPLOYMENT_QUICKSTART.md
