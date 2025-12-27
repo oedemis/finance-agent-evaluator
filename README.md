@@ -199,8 +199,8 @@ The green agent exposes 5 tools via the MCP server that purple agents can discov
 ## Dataset
 
 **Location:** `data/public.csv`
-**Size:** 50 public tasks (537 total, rest private)
-**Categories:** 9 (Quantitative Retrieval, Financial Modeling, etc.)
+**Size:** [Finance Agent Paper](https://arxiv.org/abs/2508.00828)
+**Categories:** [Finance Agent Paper](https://arxiv.org/abs/2508.00828)
 
 **Format:**
 ```csv
