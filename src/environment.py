@@ -17,7 +17,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from dataset import Task
-from tools import ToolExecutor, get_tool_definitions, TOOL_COSTS
+from tools import ToolExecutor, TOOL_COSTS
 
 logger = logging.getLogger("finance_evaluator.environment")
 
@@ -142,7 +142,6 @@ class FinancialResearchEnv(gym.Env):
         info = {
             "task_id": self.task.id,
             "category": self.task.category,
-            "tools": get_tool_definitions(),
         }
 
         return observation, info

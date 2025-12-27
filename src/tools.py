@@ -4,12 +4,14 @@ Tool implementations for Finance Agent Benchmark.
 Tools available to purple agents:
 1. edgar_search - Search SEC EDGAR database
 2. google_web_search - Search the web via Google
-3. parse_html_page - Parse and store HTML content
+3. parse_html_page - Parse and store HTML content (supports HTML and PDF)
 4. retrieve_information - Extract info from stored documents using LLM
 5. submit_answer - Submit final answer (terminates episode)
 
 Uses LiteLLM for LLM calls to support multiple providers.
 """
+import asyncio
+import io
 import json
 import logging
 import os
@@ -22,6 +24,7 @@ import backoff
 from bs4 import BeautifulSoup
 import litellm
 from litellm import completion_cost
+from pypdf import PdfReader
 
 logger = logging.getLogger("finance_evaluator.tools")
 
@@ -61,102 +64,6 @@ def retry_on_429(func):
     async def wrapper(*args, **kwargs):
         return await func(*args, **kwargs)
     return wrapper
-
-
-def get_tool_definitions() -> list[dict]:
-    """Get JSON schema definitions for all available tools."""
-    return [
-        {
-            "name": "edgar_search",
-            "description": "Search SEC EDGAR database for official regulatory filings. CRITICAL for: mergers/acquisitions (8-K), quarterly/annual financials (10-Q/10-K), executive changes, material events. Returns filing metadata with links.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search keywords related to topics, events, or financial terms (e.g., 'merger', 'acquisition', 'revenue', 'restructuring', 'dividend')"
-                    },
-                    "form_types": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Filing types: 10-K (annual), 10-Q (quarterly), 8-K (material events), DEF 14A (proxy), S-1 (IPO)"
-                    },
-                    "ciks": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Company CIK numbers - 10-digit identifier padded with zeros (e.g., ['0001318605'] for Tesla, ['0000789019'] for Microsoft). Search company name on SEC.gov to find CIK."
-                    },
-                    "start_date": {
-                        "type": "string",
-                        "description": "Start date in yyyy-mm-dd format"
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "End date in yyyy-mm-dd format"
-                    },
-                    "page": {
-                        "type": "string",
-                        "description": "Page number for pagination"
-                    },
-                    "top_n_results": {
-                        "type": "integer",
-                        "description": "Number of results to return"
-                    }
-                },
-                "required": ["query", "form_types", "ciks", "start_date", "end_date", "page", "top_n_results"]
-            }
-        },
-        {
-            "name": "google_web_search",
-            "description": "Search the web for news, analysis, and company announcements. Use for recent events, market analysis, and general research. TIP: Include specific company names, dates, and key terms.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "search_query": {
-                        "type": "string",
-                        "description": "Search query with company name, topic, and date range"
-                    }
-                },
-                "required": ["search_query"]
-            }
-        },
-        {
-            "name": "parse_html_page",
-            "description": "Parse a webpage and store its content for later analysis. IMPORTANT: Parse MULTIPLE sources (3-4) to cross-reference information. Use meaningful keys like 'sec_filing_1', 'news_article_1'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL of the page to parse"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Unique key to store content (e.g., 'source_1', 'sec_8k_filing')"
-                    }
-                },
-                "required": ["url", "key"]
-            }
-        },
-        {
-            "name": "retrieve_information",
-            "description": "Analyze and synthesize information from stored documents using LLM. MUST use {{key_name}} placeholders. TIP: Combine multiple sources in one call: 'Summarize {{source_1}} {{source_2}} {{source_3}}'",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Analysis prompt with {{key_name}} placeholders for each stored document"
-                    },
-                    "input_character_ranges": {
-                        "type": "object",
-                        "description": "Optional: character ranges for each key as {key: [start, end]}"
-                    }
-                },
-                "required": ["prompt"]
-            }
-        }
-    ]
 
 
 class BaseTool(ABC):
@@ -291,7 +198,13 @@ class ParseHtmlTool(BaseTool):
     cost = TOOL_COSTS["parse_html_page"]
 
     def __init__(self):
-        self.headers = {"User-Agent": "FinanceAgentBenchmark/2.0"}
+        # Use browser-like User-Agent to avoid 403 blocks from sites like SEC.gov
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.sec.gov/",
+        }
 
     @retry_on_429
     async def call_tool(
@@ -309,23 +222,48 @@ class ParseHtmlTool(BaseTool):
         if data_storage is None:
             data_storage = {}
 
+        # Add delay for SEC.gov to avoid rate limiting
+        if "sec.gov" in url.lower():
+            await asyncio.sleep(0.2)  # 200ms delay for SEC.gov
+
+        # Download content
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=self.headers, timeout=60) as response:
                 response.raise_for_status()
-                html_content = await response.text()
+                content_type = response.headers.get("Content-Type", "").lower()
 
-        # Parse HTML
-        soup = BeautifulSoup(html_content, "html.parser")
+                # Check if PDF based on Content-Type or URL extension
+                is_pdf = "application/pdf" in content_type or url.lower().endswith(".pdf")
 
-        # Remove script and style elements
-        for element in soup(["script", "style"]):
-            element.extract()
+                if is_pdf:
+                    # Read as bytes for PDF
+                    content = await response.read()
+                else:
+                    # Read as text for HTML
+                    content = await response.text()
 
-        # Get text
-        text = soup.get_text()
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = "\n".join(chunk for chunk in chunks if chunk)
+        # Extract text based on content type
+        if is_pdf:
+            # Parse PDF
+            pdf_file = io.BytesIO(content)
+            pdf_reader = PdfReader(pdf_file)
+            text_parts = []
+            for page in pdf_reader.pages:
+                text_parts.append(page.extract_text())
+            text = "\n\n".join(text_parts)
+        else:
+            # Parse HTML
+            soup = BeautifulSoup(content, "html.parser")
+
+            # Remove script and style elements
+            for element in soup(["script", "style"]):
+                element.extract()
+
+            # Get text
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = "\n".join(chunk for chunk in chunks if chunk)
 
         # Store in data_storage
         data_storage[key] = text

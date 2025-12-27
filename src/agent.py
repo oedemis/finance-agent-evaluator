@@ -19,7 +19,6 @@ from a2a.utils import get_message_text, new_agent_text_message
 from messenger import Messenger
 from dataset import DatasetLoader, Task, RubricItem
 from environment import FinancialResearchEnv, register_finance_env
-from tools import get_tool_definitions
 from tracer import TraceLogger
 from prompts import format_prompt
 from mcp_server import register_environment, unregister_environment
@@ -292,7 +291,7 @@ class FinanceEvaluatorAgent:
             observation, info = env.reset()
 
             # Build the initial task prompt
-            task_prompt = self._build_task_prompt(task, info)
+            task_prompt = self._build_task_prompt(task)
 
             next_message = task_prompt
             is_first_message = True
@@ -374,6 +373,30 @@ class FinanceEvaluatorAgent:
             judge_costs = final_result.get("costs", {})
             total_cost = info.get("cost", 0.0) + judge_costs.get("total_usd", 0.0)
 
+            # Extract tool call info from environment trajectory for tracer
+            trajectory = env.unwrapped.trajectory
+            for step_data in trajectory:
+                action = step_data.get("action", {})
+                tool_name = action.get("name", "unknown")
+                arguments = action.get("arguments", {})
+                observation = step_data.get("observation_preview", "")
+                # Estimate: each tool call takes ~5s on average
+                duration_ms = 5000.0
+                cost = 0.01  # Rough estimate per tool
+
+                self.tracer.log_tool_call(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=observation,
+                    cost=cost,
+                    duration_ms=duration_ms,
+                )
+
+            # Log final agent answer as message
+            agent_answer = info.get("agent_answer", "")
+            if agent_answer:
+                self.tracer.log_message("assistant", f"ANSWER: {agent_answer}")
+
             return {
                 # Legacy format (for backward compatibility)
                 "reward": final_result.get("reward", 0.0),
@@ -390,7 +413,9 @@ class FinanceEvaluatorAgent:
                 "metadata": {
                     "steps_taken": info.get("step", 0),
                     "time_seconds": task_time,
-                    "agent_answer": info.get("agent_answer", ""),
+                    "agent_answer": agent_answer,
+                    "tool_calls": info.get("tool_calls", 0),
+                    "tool_call_breakdown": info.get("tool_call_breakdown", {}),
                 },
 
                 # Cost breakdown
@@ -408,13 +433,13 @@ class FinanceEvaluatorAgent:
                 await unregister_environment(context_id)
                 logger.info(f"Unregistered environment for task {task.id} (context: {context_id})")
 
-    def _build_task_prompt(self, task: Task, info: dict) -> str:
-        """Build the initial task prompt for the purple agent."""
-        tools_json = json.dumps(get_tool_definitions(), indent=2)
+    def _build_task_prompt(self, task: Task) -> str:
+        """Build the initial task prompt for the purple agent.
 
+        Tools are provided via MCP discovery, so we only send the question.
+        """
         return format_prompt(
             "task_prompt",
             question=task.question,
-            tools_json=tools_json,
         )
 

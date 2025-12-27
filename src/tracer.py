@@ -235,6 +235,130 @@ class RunTrace:
             },
         }
 
+    def to_leaderboard_dict(self) -> dict:
+        """Convert to leaderboard-optimized format for $2M competition display.
+
+        Structure optimized for ranking and comparison:
+        - Top-level: Primary ranking metrics (benchmark mode)
+        - Second-level: Component scores (factual, contradiction, process)
+        - Third-level: Efficiency metrics (cost, time)
+        - Bottom: Full trace data for verification
+        """
+        # Calculate aggregate scores across all tasks
+        all_evals = [t.full_evaluation for t in self.tasks if t.full_evaluation]
+
+        if not all_evals:
+            # No evaluations available
+            avg_benchmark_reward = 0.0
+            avg_factual = 0.0
+            avg_contradiction = 0.0
+            avg_process = 0.0
+            avg_rl_reward = 0.0
+            benchmark_pass_rate = 0.0
+            rl_pass_rate = 0.0
+        else:
+            # Extract benchmark mode metrics
+            benchmark_rewards = [e.get("benchmark_mode", {}).get("reward", 0.0) for e in all_evals]
+            avg_benchmark_reward = sum(benchmark_rewards) / len(benchmark_rewards)
+            benchmark_pass_rate = sum(1 for e in all_evals
+                                     if e.get("benchmark_mode", {}).get("passed", False)) / len(all_evals)
+
+            # Extract component scores
+            avg_factual = sum(e.get("factual_accuracy", 0.0) for e in all_evals) / len(all_evals)
+            avg_contradiction = sum(e.get("benchmark_mode", {}).get("contradiction", {}).get("score", 1.0)
+                                   for e in all_evals) / len(all_evals)
+            avg_process = sum(e.get("process_quality", 0.0) for e in all_evals) / len(all_evals)
+
+            # Extract RL mode metrics
+            rl_rewards = [e.get("rl_mode", {}).get("reward", 0.0) for e in all_evals]
+            avg_rl_reward = sum(rl_rewards) / len(rl_rewards)
+            rl_pass_rate = sum(1 for e in all_evals
+                              if e.get("rl_mode", {}).get("passed", False)) / len(all_evals)
+
+        # Calculate per-category metrics
+        per_category_metrics = {}
+        category_tasks = {}
+        for task in self.tasks:
+            cat = task.category
+            if cat not in category_tasks:
+                category_tasks[cat] = []
+            category_tasks[cat].append(task)
+
+        for cat, tasks in category_tasks.items():
+            cat_evals = [t.full_evaluation for t in tasks if t.full_evaluation]
+            if cat_evals:
+                per_category_metrics[cat] = {
+                    "benchmark_reward": sum(e.get("benchmark_mode", {}).get("reward", 0.0)
+                                          for e in cat_evals) / len(cat_evals),
+                    "pass_rate": sum(1 for e in cat_evals
+                                   if e.get("benchmark_mode", {}).get("passed", False)) / len(cat_evals),
+                    "task_count": len(tasks),
+                }
+
+        return {
+            # Submission identification
+            "submission": {
+                "run_id": self.run_id,
+                "agent_url": self.purple_agent_url,
+                "timestamp": self.completed_at or self.started_at,
+                "config": self.config,
+            },
+
+            # PRIMARY METRICS (for ranking and leaderboard display)
+            "leaderboard_metrics": {
+                "class_balanced_accuracy": self.class_balanced_accuracy,  # ⭐ MAIN RANKING METRIC
+                "naive_accuracy": self.naive_accuracy,
+                "benchmark_reward": avg_benchmark_reward,  # 0.7*factual + 0.3*contradiction
+                "benchmark_pass_rate": benchmark_pass_rate,  # % tasks passed benchmark criteria
+            },
+
+            # COMPONENT SCORES (understanding what drives performance)
+            "component_scores": {
+                "factual_accuracy": avg_factual,      # % of rubrics matched
+                "contradiction_score": avg_contradiction,  # 1.0 = no contradictions
+                "process_quality": avg_process,       # ⭐ Separate process metric
+            },
+
+            # EFFICIENCY METRICS (cost-performance tradeoff)
+            "efficiency": {
+                "avg_cost_per_task": self.total_cost / self.total_tasks if self.total_tasks > 0 else 0.0,
+                "avg_time_per_task": self.total_time / self.total_tasks if self.total_tasks > 0 else 0.0,
+                "total_cost": self.total_cost,
+                "total_time": self.total_time,
+                "cost_accuracy_ratio": (self.total_cost / self.class_balanced_accuracy
+                                       if self.class_balanced_accuracy > 0 else float('inf')),
+            },
+
+            # RL MODE METRICS (for training and improvement)
+            "rl_metrics": {
+                "rl_reward": avg_rl_reward,  # 0.5*factual + 0.2*contra + 0.3*process
+                "rl_pass_rate": rl_pass_rate,
+            },
+
+            # PER-CATEGORY BREAKDOWN
+            "per_category": per_category_metrics,
+
+            # DETAILED RESULTS (for verification and debugging)
+            "detailed_results": {
+                "total_tasks": self.total_tasks,
+                "passed_tasks": self.passed_tasks,
+                "task_summaries": [
+                    {
+                        "task_id": t.task_id,
+                        "category": t.category,
+                        "benchmark_reward": t.full_evaluation.get("benchmark_mode", {}).get("reward", 0.0) if t.full_evaluation else 0.0,
+                        "passed": t.full_evaluation.get("benchmark_mode", {}).get("passed", False) if t.full_evaluation else False,
+                        "cost": t.total_cost,
+                        "time": t.duration_seconds,
+                    }
+                    for t in self.tasks
+                ],
+            },
+
+            # Link to full trace
+            "trace_file": f"{self.run_id}.json",
+        }
+
 
 class TraceLogger:
     """Logger that saves execution traces to JSON files."""
@@ -298,14 +422,19 @@ class TraceLogger:
         return None
 
     def _save_run(self):
-        """Save the current run to disk."""
+        """Save the current run to disk in multiple formats."""
         if not self.output_dir or not self.current_run:
             return
 
-        # Save full trace
+        # Save full trace (for debugging)
         trace_file = self.output_dir / f"{self.current_run.run_id}.json"
         with open(trace_file, "w") as f:
             json.dump(self.current_run.to_dict(), f, indent=2)
+
+        # Save leaderboard format (for ranking/comparison)
+        leaderboard_file = self.output_dir / f"{self.current_run.run_id}_leaderboard.json"
+        with open(leaderboard_file, "w") as f:
+            json.dump(self.current_run.to_leaderboard_dict(), f, indent=2)
 
         # Save summary
         summary_file = self.output_dir / f"{self.current_run.run_id}_summary.json"

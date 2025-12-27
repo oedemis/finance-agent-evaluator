@@ -265,15 +265,15 @@ async def parse_html_page(
     key: str,
 ) -> dict:
     """
-    Parse HTML content from a URL and store it for later retrieval.
+    Parse HTML content from a URL and store it under a key.
 
     Args:
         context_id: A2A context identifier for state isolation
         url: URL of the page to parse
-        key: Storage key for later retrieval (use in retrieve_information)
+        key: Unique storage key (e.g., "source_1", "article_2")
 
     Returns:
-        dict: {"success": bool, "result": str} with parsed content preview
+        dict: {"success": bool, "result": str} with storage confirmation
     """
     logger.info(f"[{context_id}] MCP parse_html_page → routing to environment")
 
@@ -299,15 +299,18 @@ async def retrieve_information(
     input_character_ranges: Optional[dict[str, list[int]]] = None,
 ) -> dict:
     """
-    Use LLM to extract information from stored documents (via RAG).
+    Extract information from stored documents using LLM.
+
+    CRITICAL: Your prompt MUST include {{key_name}} placeholders to reference stored content.
+    Example: "Summarize {{source_1}} and {{source_2}}" where source_1, source_2 are storage keys.
 
     Args:
         context_id: A2A context identifier for state isolation
-        prompt: Prompt with placeholders like "Extract revenue from {{earnings_report}}"
-        input_character_ranges: Optional character slicing per key (e.g., {"earnings_report": [0, 5000]})
+        prompt: Analysis prompt with {{key_name}} placeholders. Example: "Compare {{filing_1}} and {{article_2}}"
+        input_character_ranges: Optional character ranges per key, e.g. {"key1": [0, 5000]}
 
     Returns:
-        dict: {"success": bool, "result": str, "usage": dict} with LLM analysis and token usage
+        dict: {"success": bool, "result": str, "usage": dict} with analysis and token usage
     """
     logger.info(f"[{context_id}] MCP retrieve_information → routing to environment")
 
