@@ -56,7 +56,7 @@ jobs:
             -e SEC_EDGAR_API_KEY="${{ secrets.SEC_EDGAR_API_KEY }}" \
             -e SERPAPI_API_KEY="${{ secrets.SERPAPI_API_KEY }}" \
             -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+            ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
 
           # Wait for agent to start
           echo "Waiting for agent to start..."
