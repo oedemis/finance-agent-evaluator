@@ -168,10 +168,14 @@ class Messenger:
                 }
             ) as span:
                 try:
+                    # Use pre-set context_id if available, regardless of new_conversation flag
+                    # This is critical for MCP: green agent registers environment with context_id
+                    # BEFORE sending the first message, so we must use that context_id
+                    preset_context_id = self._context_ids.get(url)
                     outputs = await send_message(
                         message=message,
                         base_url=url,
-                        context_id=None if new_conversation else self._context_ids.get(url, None),
+                        context_id=preset_context_id,
                         timeout=timeout,
                     )
                     response = outputs.get("response", "")
@@ -209,10 +213,12 @@ class Messenger:
                     raise
         else:
             # No tracing available
+            # Use pre-set context_id if available
+            preset_context_id = self._context_ids.get(url)
             outputs = await send_message(
                 message=message,
                 base_url=url,
-                context_id=None if new_conversation else self._context_ids.get(url, None),
+                context_id=preset_context_id,
                 timeout=timeout,
             )
             if outputs.get("status", "completed") != "completed":
