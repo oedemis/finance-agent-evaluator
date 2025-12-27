@@ -124,7 +124,7 @@ docker build -t finance-evaluator:v2.0 .
 docker run -p 9009:9009 --env-file .env finance-evaluator:v2.0
 ```
 
-### Run with FAB Scenario Runner
+### Run with FAB Scenario Runner in another repository
 
 ```bash
 cd ../FAB
