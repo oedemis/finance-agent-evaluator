@@ -22,8 +22,8 @@ RUN uv pip install --system -e .
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:9009/health || exit 1
 
-# Expose A2A port
-EXPOSE 9009
+# Expose A2A port and MCP port
+EXPOSE 9009 9020
 
 # Set entrypoint - using new server.py
 ENTRYPOINT ["python", "src/server.py"]
