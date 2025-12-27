@@ -110,7 +110,12 @@ class FinancialResearchEnv(gym.Env):
         # Action space: JSON string representing tool call
         self.action_space = spaces.Text(max_length=10000)
         # Observation space: JSON string representing observation
+        # Note: We set max_length but disable env checker to avoid warnings
         self.observation_space = spaces.Text(max_length=100000)
+
+        # Disable Gymnasium's passive env checker warnings
+        import os
+        os.environ['GYM_DISABLE_WARNINGS'] = '1'
 
     def reset(
         self,
@@ -188,6 +193,8 @@ class FinancialResearchEnv(gym.Env):
                 "cost": self.state.cost_spent,
                 "agent_answer": self.agent_answer,
                 "evaluation": evaluation,
+                "tool_calls": len(self.state.tools_used),
+                "tool_call_breakdown": dict(self.state.tool_call_count),
             }
 
             # Log trajectory

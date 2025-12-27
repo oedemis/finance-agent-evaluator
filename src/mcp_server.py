@@ -162,7 +162,8 @@ async def get_storage(context_id: str) -> dict[str, str]:
 mcp = FastMCP(
     name="FinanceEvaluatorTools",
     version="1.0.0",
-    instructions="Financial research tools for purple agents: SEC EDGAR search, web search, HTML parsing, RAG retrieval, and answer submission."
+    instructions="Financial research tools for purple agents: SEC EDGAR search, web search, HTML parsing, RAG retrieval, and answer submission.",
+    stateless_http=True,  # Fix for FastMCP Issue #823: Server crashes on client timeout
 )
 
 
@@ -324,7 +325,12 @@ async def retrieve_information(
     logger.info(f"[{context_id}] retrieve_information completed: cost=${info.get('cost', 0):.4f}")
 
     # Return observation as MCP result
-    return {"success": True, "result": observation}
+    result = {"success": True, "result": observation}
+
+    # DEBUG: Log the actual payload being returned
+    logger.info(f"[{context_id}] retrieve_information PAYLOAD: type={type(observation)}, len={len(str(observation)) if observation else 0}, preview={str(observation)[:200] if observation else 'None'}...")
+
+    return result
 
 
 @mcp.tool()
@@ -371,12 +377,12 @@ async def submit_answer(
 
     logger.info(f"[{context_id}] submit_answer completed: reward={reward}, terminated={terminated}")
 
-    # Return observation as MCP result (includes answer and sources)
+    # Return minimal response to avoid FastMCP Client timeout on large payloads
+    # Purple agent doesn't need the data - it already has the answer and will send via A2A
+    # The evaluation result is retrieved by green agent from environment directly
     return {
         "success": True,
-        "result": observation,
-        "answer": answer,
-        "sources": sources,
+        "message": "Answer submitted and evaluated successfully"
     }
 
 

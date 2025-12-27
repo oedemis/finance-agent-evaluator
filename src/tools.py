@@ -182,11 +182,11 @@ class BaseTool(ABC):
             logger.info(f"[TOOL: {self.name.upper()}] Returned: {str(result)[:200]}...")
 
             # Special handling for retrieve_information (returns usage metadata)
+            # Note: usage is logged server-side, no need to return to client
             if self.name == "retrieve_information" and isinstance(result, dict):
                 return {
                     "success": True,
                     "result": result.get("retrieval", result),
-                    "usage": result.get("usage", {}),
                 }
             else:
                 return {"success": True, "result": json.dumps(result) if not isinstance(result, str) else result}
@@ -348,7 +348,7 @@ class RetrieveInformationTool(BaseTool):
     name = "retrieve_information"
     cost = TOOL_COSTS["retrieve_information"]
 
-    def __init__(self, model: str = "gpt-4o-mini"):
+    def __init__(self, model: str = "openai/gpt-4o-mini"):
         self.model = model
 
     async def call_tool(
@@ -408,11 +408,15 @@ class RetrieveInformationTool(BaseTool):
         formatted_prompt = re.sub(r"{{([^{}]+)}}", r"{\1}", prompt)
         final_prompt = formatted_prompt.format(**formatted_data)
 
-        # Call LLM via LiteLLM
+        # Call LLM via LiteLLM with concise response requirement
+        # Keep responses small to avoid FastMCP Client StreamableHTTP bug with large payloads
         response = await litellm.acompletion(
             model=self.model,
-            messages=[{"role": "user", "content": final_prompt}],
-            max_tokens=1000,
+            messages=[
+                {"role": "system", "content": "Provide concise answers in 2-3 bullet points. Maximum 100 words. Be direct and factual."},
+                {"role": "user", "content": final_prompt}
+            ],
+            max_tokens=200,  # Reduced to keep responses consistently under 1000 bytes for FastMCP
         )
 
         answer = response.choices[0].message.content
