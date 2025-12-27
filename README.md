@@ -2,7 +2,7 @@
 
 **Version:** 2.0.0
 **Type:** Green Agent (Evaluator)
-**Framework:** Gymnasium + A2A Protocol
+**Framework:** MCP + Gymnasium + A2A Protocol
 
 ## Overview
 
@@ -10,7 +10,7 @@ The Finance Agent Evaluator is a green agent that evaluates purple agents (finan
 
 ### Key Features
 
-- **State-Tracked Research**: Gymnasium environment tracks research process
+- **State-Tracked Research**: Gymnasium environment tracks research process :) trial
 - **Multi-Dimensional Evaluation**: 6 metrics (factual accuracy, process quality, cost, time, etc.)
 - **League of Judges**: 2 specialized LLM judges + rule-based metrics
 - **Rich Reporting**: Class-balanced accuracy, dimensional scores, weakness profiling
@@ -302,16 +302,11 @@ Response: Streamed A2A messages with task updates and final artifact.
 4. Run tests and linting
 5. Submit pull request
 
-## License
-
-TBD
 
 ## References
 
-- [Design Document](../FAB/docs/design.md)
 - [AgentBeats Documentation](https://docs.agentbeats.dev/)
 - [Finance Agent Paper](https://arxiv.org/abs/2508.00828)
-- [Gymnasium Documentation](https://gymnasium.farama.org/)
 
 ## Contact
 
